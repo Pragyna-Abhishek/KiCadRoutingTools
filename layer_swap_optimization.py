@@ -1206,9 +1206,7 @@ def apply_single_ended_layer_swaps(
         # Skip multi-point nets - layer swaps not yet supported for them
         multipoint_pads = get_multipoint_net_pads(pcb_data, net_id, config)
         if multipoint_pads:
-            layers_used = {config.layers[ep[2]] for ep in multipoint_pads}
-            if len(layers_used) > 1:
-                skipped_multipoint.append(net_name)
+            skipped_multipoint.append(net_name)
             continue
         sources, targets, error = get_net_endpoints(pcb_data, net_id, config)
         if error or not sources or not targets:
@@ -1219,7 +1217,7 @@ def apply_single_ended_layer_swaps(
             single_net_layer_info[net_name] = (src_layer, tgt_layer, sources, targets, net_id)
 
     if skipped_multipoint:
-        print(f"\nWARNING: Skipping stub layer swapping for {len(skipped_multipoint)} multi-point net(s) (not yet supported)")
+        print(f"\nWARNING: Skipping layer swaps for {len(skipped_multipoint)} multi-point net(s) (not yet supported)")
         if len(skipped_multipoint) <= 5:
             for name in skipped_multipoint:
                 print(f"    - {name}")

@@ -637,6 +637,33 @@ def extract_board_contours(content: str) -> Tuple[List[Tuple[float, float]], Lis
     outline = contours[0]
     cutouts = contours[1:]
 
+    # SCAN_LAB PATCH (see repo-root CLAUDE.md "vendored router" section for
+    # why this exists — not a behavior change we want to drift from
+    # upstream, but a targeted guard against a chaining failure mode we hit
+    # on real boards): _chain_segments_into_contours requires every segment
+    # in a connected group to link end-to-end before accepting it as a
+    # contour (see its `len(used) == len(group_segs)` check) — a single
+    # segment whose endpoint doesn't land within `tol` of its neighbor (real
+    # boards with imported/DXF-derived Edge.Cuts geometry can have such
+    # gaps) silently drops the ENTIRE group, including boards where that
+    # group was the true outer boundary.  The bug is upstream and only
+    # reproduces on specific real-world files, so it isn't safe to fix by
+    # editing the chaining/union-find logic itself here.  Instead: if the
+    # selected outline's own bounding-box area is far smaller than the
+    # combined bounding box of every Edge.Cuts segment on the board, that's
+    # a strong signal the true boundary failed to chain and a much smaller,
+    # unrelated closed shape (an interior contour, a rounded-corner remnant)
+    # was picked instead.  Falling back to `[], []` here makes the caller
+    # use the (always-correct) axis-aligned board_bounds instead of routing
+    # against a wrong polygon that silently treats real board area as
+    # "outside the board".
+    all_xs = [p[0] for seg in segments for p in seg]
+    all_ys = [p[1] for seg in segments for p in seg]
+    segments_bbox_area = (max(all_xs) - min(all_xs)) * (max(all_ys) - min(all_ys))
+    outline_area = contour_bbox_area(outline)
+    if segments_bbox_area > 0 and outline_area < 0.5 * segments_bbox_area:
+        return [], []
+
     return outline, cutouts
 
 
