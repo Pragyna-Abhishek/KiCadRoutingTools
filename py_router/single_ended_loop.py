@@ -1379,6 +1379,16 @@ def route_single_ended_nets(
                             if net_id in remaining_net_ids:
                                 remaining_net_ids.remove(net_id)
                             routed_net_ids.append(net_id)
+                            # #622 take-2: the emitted landing leg must ride
+                            # the RETRY result too, or the end-of-run sync
+                            # strips it as neither-original-nor-routed and
+                            # the net reports a false open (the f4_2 bug,
+                            # previously fixed only on the first-pass path).
+                            if _leg_segs_622:
+                                retry_result['new_segments'] = (
+                                    list(retry_result['new_segments'])
+                                    + list(_leg_segs_622))
+                                _leg_segs_622 = None
                             routed_results[net_id] = retry_result
                             record_net_event(state, net_id, "reroute_succeeded", {
                                 "N": N,
@@ -1678,7 +1688,33 @@ def route_single_ended_nets(
                     successful += 1
                     successful -= _rescued.pop('_rescue_rip_was_in_results', 0)
                     total_iterations += _rescued['iterations']
+                    # #622 take-2: rescued routes carry the landing leg in
+                    # their result for the same sync-survival reason as the
+                    # first-pass and retry sites above.
+                    if _leg_segs_622:
+                        _rescued['new_segments'] = (
+                            list(_rescued.get('new_segments') or [])
+                            + list(_leg_segs_622))
+                        _leg_segs_622 = None
                 else:
                     failed += 1
+                    # #622 take-2 leg cleanup: this member terminally
+                    # failed, so its exact-emitted landing leg is copper
+                    # for a route that never arrived -- retract it and
+                    # re-point the group target at the BALL so any later
+                    # attempt re-derives (and re-emits) from scratch.
+                    if _leg_segs_622:
+                        from bus_terminal import remove_landing_leg
+                        _n_rm = remove_landing_leg(pcb_data, _leg_segs_622)
+                        if _leg_tip_622 is not None:
+                            _bg_rm = (bus_net_to_group or {}).get(net_id)
+                            if _bg_rm is not None \
+                                    and net_id in _bg_rm.net_ids:
+                                _bg_rm.target_positions[
+                                    _bg_rm.net_ids.index(net_id)] = \
+                                    _leg_tip_622[1]
+                        print(f"  Landing leg retracted: {_n_rm} seg(s) "
+                              f"freed after terminal route failure")
+                        _leg_segs_622 = None
 
     return successful, failed, total_time, total_iterations, route_index, user_quit

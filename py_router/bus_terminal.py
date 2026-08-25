@@ -84,6 +84,23 @@ def _leg_clear(pcb_data: PCBData, pts: List[Tuple[float, float]],
     return True
 
 
+def remove_landing_leg(pcb_data: PCBData, leg_segs: List[Segment]) -> int:
+    """Retract an emitted landing leg after its member terminally failed
+    to route: the leg is copper for a route that never arrived -- left in
+    place it ships as an attached spur (and re-poisons the next attempt's
+    endpoint derivation). Removes the segments from pcb_data.segments and
+    the _emitted_legs ledger by IDENTITY; returns the count removed."""
+    if not leg_segs:
+        return 0
+    ids = {id(s) for s in leg_segs}
+    pcb_data.segments[:] = [s for s in pcb_data.segments
+                            if id(s) not in ids]
+    legs = getattr(pcb_data, '_emitted_legs', None)
+    if legs:
+        legs[:] = [s for s in legs if id(s) not in ids]
+    return len(ids)
+
+
 def emit_landing_leg(pcb_data: PCBData, net_id: int,
                      ball_xy: Tuple[float, float],
                      approach_from: Tuple[float, float],
