@@ -1367,6 +1367,18 @@ def route_single_ended_nets(
                                 config, net_id, pcb_data)
                             retry_reverse_direction = False
                         retry_cfg = bus_stick_config(config, retry_attraction_path)
+                        # #622 basin fallback: a locked lane must never cost
+                        # completion -- retries (post-rip) route with the
+                        # off-lane bowl disarmed, so a member whose lane is
+                        # blocked detours like a plain net instead of dying.
+                        # bus_stick_config returns config UNCHANGED when the
+                        # stick is off -- setting the override on that shared
+                        # object would disarm the basin for every later net.
+                        if retry_cfg is config:
+                            from dataclasses import replace as _rep_b622
+                            retry_cfg = _rep_b622(config)
+                        object.__setattr__(retry_cfg,
+                                           'attraction_basin_override', 0)
                         # #572: a forced-link net retries its EXACT links
                         # against the post-rip board (same reason as the
                         # initial attempt: derivation is model-blind to the

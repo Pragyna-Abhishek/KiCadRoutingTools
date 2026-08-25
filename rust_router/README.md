@@ -312,6 +312,17 @@ src/
 ## Version History
 
 
+### 0.21.2 (2026-08-23)
+
+- `GridRouter` gains `attraction_basin_pct` (#622, default 0 = off): a
+  per-step off-lane tax of `(attraction_potential - phi(cell)) * pct/100`,
+  computed from the same bucketed potential lookup the #656 shaping already
+  pays. Zero on the attraction lane, graded inside the radius, and held at
+  its maximum everywhere beyond -- long-range lane guidance the
+  radius-bounded potential cannot provide (outside the radius the potential
+  is flat zero). Applied to steps and to via moves (destination layer's
+  cell). Armed from Python via `KICAD_ATTRACT_BASIN_PCT`.
+
 ### 0.21.1 (2026-08-16)
 
 - PoseRouter (diff pairs): `layer_direction_preferences` +

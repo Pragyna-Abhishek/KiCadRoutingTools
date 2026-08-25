@@ -818,9 +818,16 @@ impl GridSearch {
                 // refunds, constant-phi travel pays full price -- cycles
                 // always cost > 0, so looping can never profit.
                 let step_cost = if router.attraction_potential > 0 {
-                    let d_phi = router.path_attraction_potential(ngx, ngy, current.layer)
+                    let phi_next = router.path_attraction_potential(ngx, ngy, current.layer);
+                    let d_phi = phi_next
                         - router.path_attraction_potential(current.gx, current.gy, current.layer);
-                    (step_cost - d_phi).max(move_cost / 10)
+                    let mut c = (step_cost - d_phi).max(move_cost / 10);
+                    // #622 basin: off-lane per-step tax, max outside the radius
+                    if router.attraction_basin_pct > 0 {
+                        c += (router.attraction_potential - phi_next).max(0)
+                            * router.attraction_basin_pct / 100;
+                    }
+                    c
                 } else { step_cost };
                 let new_g = g + step_cost;
 
@@ -947,11 +954,18 @@ impl GridSearch {
                 // always lacked (a planned dive can now outbid via_cost).
                 // Floored at 0 like the free-via case; the reverse via
                 // refunds the jump, so a down-up flip nets >= 2*via_cost.
-                let via_shaping = if router.attraction_potential > 0 {
-                    router.path_attraction_potential(current.gx, current.gy, layer)
-                        - router.path_attraction_potential(current.gx, current.gy, current.layer)
-                } else { 0 };
-                let new_g = g + (combined_via_cost + proximity_cost - via_shaping).max(0);
+                let (via_shaping, via_basin) = if router.attraction_potential > 0 {
+                    let phi_dst = router.path_attraction_potential(current.gx, current.gy, layer);
+                    let shaping = phi_dst
+                        - router.path_attraction_potential(current.gx, current.gy, current.layer);
+                    // #622 basin on the DESTINATION layer's cell, same tax as a step
+                    let basin = if router.attraction_basin_pct > 0 {
+                        (router.attraction_potential - phi_dst).max(0)
+                            * router.attraction_basin_pct / 100
+                    } else { 0 };
+                    (shaping, basin)
+                } else { (0, 0) };
+                let new_g = g + (combined_via_cost + proximity_cost - via_shaping).max(0) + via_basin;
 
                 if new_g < existing_g {
                     if existing_g != i32::MAX {
@@ -1026,18 +1040,28 @@ pub struct GridRouter {
     // can genuinely compete with via_cost -- the capability no bounded
     // per-step discount has.
     attraction_potential: i32,
+    // #622 basin: per-step OFF-LANE tax derived from the same potential
+    // lookup -- each move into a cell charges
+    // (attraction_potential - phi(cell)) * attraction_basin_pct / 100.
+    // Zero on the lane, graded inside the radius, and HELD AT MAX
+    // everywhere beyond it: the long-range guidance the radius-bounded
+    // potential cannot give (outside the radius the potential is flat
+    // zero, so nothing steers toward the lane). A per-cell cost, not a
+    // potential: long off-lane travel pays continuously. 0 = off.
+    attraction_basin_pct: i32,
 }
 
 #[pymethods]
 impl GridRouter {
     #[new]
-    #[pyo3(signature = (via_cost, h_weight, turn_cost=None, via_proximity_cost=1, vertical_attraction_radius=0, vertical_attraction_bonus=0, layer_costs=None, proximity_heuristic_cost=None, layer_direction_preferences=None, direction_preference_cost=0, attraction_radius=0, attraction_bonus=0, attraction_cross_layer_pct=0, attraction_potential=0))]
+    #[pyo3(signature = (via_cost, h_weight, turn_cost=None, via_proximity_cost=1, vertical_attraction_radius=0, vertical_attraction_bonus=0, layer_costs=None, proximity_heuristic_cost=None, layer_direction_preferences=None, direction_preference_cost=0, attraction_radius=0, attraction_bonus=0, attraction_cross_layer_pct=0, attraction_potential=0, attraction_basin_pct=0))]
     pub fn new(via_cost: i32, h_weight: f32, turn_cost: Option<i32>, via_proximity_cost: Option<i32>,
                vertical_attraction_radius: i32, vertical_attraction_bonus: i32,
                layer_costs: Option<Vec<i32>>, proximity_heuristic_cost: Option<i32>,
                layer_direction_preferences: Option<Vec<u8>>, direction_preference_cost: i32,
                attraction_radius: i32, attraction_bonus: i32,
-               attraction_cross_layer_pct: i32, attraction_potential: i32) -> Self {
+               attraction_cross_layer_pct: i32, attraction_potential: i32,
+               attraction_basin_pct: i32) -> Self {
         Self {
             via_cost,
             h_weight,
@@ -1055,6 +1079,7 @@ impl GridRouter {
             attraction_cross_layer_pct,
             attraction_path_buckets: FxHashMap::default(),
             attraction_potential,
+            attraction_basin_pct,
         }
     }
 

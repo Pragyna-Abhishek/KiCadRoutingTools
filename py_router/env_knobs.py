@@ -493,6 +493,9 @@ def refresh() -> None:
         # construction (see rust GridRouter.attraction_potential). Sized
         # against via_cost: ~60-70 lets a planned dive outbid a 75 via.
         'attract_potential': _i('KICAD_ATTRACT_POTENTIAL', 0),
+        # #622 basin: per-step off-lane tax pct of (potential - phi);
+        # max outside the attraction radius (long-range lane guidance)
+        'attract_basin_pct': _i('KICAD_ATTRACT_BASIN_PCT', 0),
         # Front-load list (#589 escape-risk ordering experiment): a file of
         # net names (one per line); listed nets move to the FRONT of their
         # #472 partition block in file order, others keep relative order.
