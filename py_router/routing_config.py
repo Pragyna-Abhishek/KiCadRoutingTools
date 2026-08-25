@@ -308,6 +308,20 @@ class GridRouteConfig:
     guide_corridor_layer: str = "User.1"  # User layer the guide polyline is drawn on
     guide_corridor_spacing: float = 0.0  # mm; 0 = endpoints only, else subdivide long segments
     corridor_waypoints: List[Tuple[int, int]] = field(default_factory=list)  # prebuilt grid waypoints
+    # #622 take-2: corridor_waypoints carries a bus member's terminal
+    # LANDING-LEG corners; True lets them through the bus single-direction
+    # waypoint bypass (a declared field so dataclasses.replace preserves it
+    # -- a dynamic attr was dropped by an intermediate replace and the
+    # waypoints silently never fired).
+    bus_leg_waypoints: bool = False
+    # #622 take-2 exact landing legs: ((tip_x, tip_y), (ball_x, ball_y))
+    # of the emitted leg (mm). When set, get_net_endpoints forces the
+    # TARGET end to the tip and drops leg-copper points from the sources --
+    # the leg attached to the ball otherwise perturbs the copper-size-
+    # ranked endpoint derivation (measured: both route ends resolved
+    # around the leg and the source side was never routed, f3_2).
+    bus_landing_tip: Optional[Tuple[Tuple[float, float],
+                                    Tuple[float, float]]] = None
     # Keepout zone - keep routed tracks out of a user-drawn polygon (issue #27)
     keepout_enabled: bool = False  # Block routed tracks from a drawn keepout polygon
     keepout_layer: str = "User.2"  # User layer the keepout polygon is drawn on

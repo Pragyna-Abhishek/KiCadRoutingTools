@@ -59,7 +59,8 @@ def assign_layers_smart(routes: List[FanoutRoute],
                         clearance: float,
                         diff_pair_spacing: float = 0.0,
                         existing_tracks: List[Dict] = None,
-                        no_inner_top_layer: bool = False) -> None:
+                        no_inner_top_layer: bool = False,
+                        planned_layers: Dict[int, str] = None) -> None:
     """
     Assign layers to routes to avoid all collisions.
 
@@ -82,12 +83,33 @@ def assign_layers_smart(routes: List[FanoutRoute],
     # Two traces from the same pair use 2*track_width + diff_pair_spacing
     pair_width = 2 * track_width + diff_pair_spacing
 
-    # Edge routes stay on first layer
+    # #622 bus-plan layer assignment: the plan steers, feasibility decides.
+    # A planned INNER route leads its greedy candidate order with the
+    # planned layer (the overlap checks below stay the capacity gate -- a
+    # FORCED immovable seed just pushed the conflicts into collision
+    # resolution, which moved ~15 nets messily on allwinner DU1); a planned
+    # EDGE route takes its planned layer directly (a bottom-layer edge
+    # tooth is the plan's non-blocking eviction, and direct boundary
+    # escapes carry no channel overlap). End-matching reads COMMITTED
+    # copper at the facing fanout, so a plan the checks overrode stays
+    # honest -- the divergence is audited and printed by the caller.
+    planned_layers = planned_layers or {}
+    planned_route_ids: Set[int] = set()
+    for route in routes:
+        pl = planned_layers.get(route.net_id)
+        if pl and pl in available_layers and route.is_edge:
+            route.layer = pl
+            planned_route_ids.add(id(route))
+
+    # Edge routes stay on first layer (planned ones keep their plan); only
+    # top-layer edge routes act as the horizontal-crossing obstacles below.
     edge_routes = []
     for route in routes:
         if route.is_edge:
-            route.layer = available_layers[0]
-            edge_routes.append(route)
+            if id(route) not in planned_route_ids:
+                route.layer = available_layers[0]
+            if route.layer == available_layers[0]:
+                edge_routes.append(route)
 
     # Build lookup from pair_id to routes
     pair_routes: Dict[str, List[FanoutRoute]] = defaultdict(list)
@@ -101,10 +123,12 @@ def assign_layers_smart(routes: List[FanoutRoute],
     for pair_id, routes_in_pair in pair_routes.items():
         if any(r.is_edge for r in routes_in_pair):
             half_edge_pairs.add(pair_id)
-            # Set ALL routes in this pair to F.Cu
+            # Set ALL routes in this pair to F.Cu (planned routes keep
+            # their plan -- #622)
             for r in routes_in_pair:
-                r.layer = available_layers[0]
-                if r not in edge_routes:
+                if id(r) not in planned_route_ids:
+                    r.layer = available_layers[0]
+                if r.layer == available_layers[0] and r not in edge_routes:
                     edge_routes.append(r)
 
     # Group inner routes by (channel_index, escape_direction)
@@ -162,9 +186,18 @@ def assign_layers_smart(routes: List[FanoutRoute],
                 candidate_layers = available_layers[1:] if len(available_layers) > 1 else available_layers
             else:
                 candidate_layers = available_layers
+                # #622: the layer plan's choice leads the candidate order;
+                # the overlap checks below stay the capacity gate.
+                _pl = planned_layers.get(route.net_id)
+                if _pl and _pl in candidate_layers:
+                    candidate_layers = [_pl] + [l for l in candidate_layers
+                                                if l != _pl]
 
+            import os as _os
+            _dbg = _os.environ.get('KICAD_FANOUT_DEBUG_LAYER')
             for layer in candidate_layers:
                 conflict = False
+                _why = None
                 # Check against all previously assigned routes on this layer in this group
                 for other in group_routes:
                     if other is route:
@@ -181,6 +214,7 @@ def assign_layers_smart(routes: List[FanoutRoute],
                         spacing = pair_width + clearance
                     if segments_overlap_on_channel(route, other, spacing):
                         conflict = True
+                        _why = f'channel-overlap with net_{other.net_id}'
                         break
 
                 # Also check against edge routes if assigning to first layer (F.Cu)
@@ -219,6 +253,7 @@ def assign_layers_smart(routes: List[FanoutRoute],
                                 else:
                                     conflict = True
                                 if conflict:
+                                    _why = f'edge-route crossing net_{edge_route.net_id}'
                                     break
 
                 # Check against existing tracks from the PCB on this layer
@@ -247,11 +282,16 @@ def assign_layers_smart(routes: List[FanoutRoute],
                                                        existing['start'], existing['end'],
                                                        min_spacing):
                                 conflict = True
+                                _why = ('existing-track net_%s %s->%s' % (existing.get('net_id'), existing['start'], existing['end']))
                                 break
                         if conflict:
                             break
 
+                if _dbg and conflict:
+                    print(f'  [layer-dbg] net_{route.net_id} ch={route.channel.index} dir={route.escape_dir} REJECT {layer}: {_why}')
                 if not conflict:
+                    if _dbg:
+                        print(f'  [layer-dbg] net_{route.net_id} ch={route.channel.index} dir={route.escape_dir} -> {layer}')
                     route.layer = layer
                     assigned = True
                     # If this is a diff pair, mark it as assigned and set partner's layer

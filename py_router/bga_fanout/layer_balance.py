@@ -140,6 +140,7 @@ def rebalance_layers(
     existing_tracks: List[Dict],
     layers: List[str],
     min_spacing: float,
+    pinned_net_ids: Set[int] = None,
 ) -> int:
     """
     Rebalance routes across layers for even distribution.
@@ -158,6 +159,12 @@ def rebalance_layers(
         return 0
 
     all_layers = layers
+
+    # #622 bus-plan layer assignment: planned nets are PINNED -- evenness is
+    # not a goal the plan recognizes (an even rebalance is exactly what moved
+    # a direct-escape westmost edge ball onto the bottom layer + pad via and
+    # broke facing-comb layer matching on allwinner DU1).
+    pinned_net_ids = pinned_net_ids or set()
 
     # Track original layers to count net changes at the end
     original_layers = {id(route): route.layer for route in routes}
@@ -247,6 +254,8 @@ def rebalance_layers(
         for route in routes:
             if route.layer != max_layer:
                 continue
+            if route.net_id in pinned_net_ids:
+                continue  # #622: the layer plan owns this net
 
             if route.pair_id:
                 if route.pair_id in processed_pairs:
@@ -256,6 +265,8 @@ def rebalance_layers(
                     continue
                 pair_routes = [r for r in routes if r.pair_id == route.pair_id]
                 if not all(r.layer == max_layer for r in pair_routes):
+                    continue
+                if any(r.net_id in pinned_net_ids for r in pair_routes):
                     continue
             else:
                 pair_routes = [route]
@@ -338,6 +349,8 @@ def rebalance_layers(
                 pair_routes = [r for r in routes if r.pair_id == route.pair_id]
                 if not all(r.layer == max_edge_layer for r in pair_routes):
                     continue
+                if any(r.net_id in pinned_net_ids for r in pair_routes):
+                    continue  # #622: the layer plan owns this pair
 
                 all_route_segs = []
                 all_net_ids = set()

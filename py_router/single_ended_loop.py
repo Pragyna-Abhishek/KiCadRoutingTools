@@ -462,6 +462,17 @@ def route_single_ended_nets(
         if _raw_n != len(bus_groups):
             print(f"  Bus filter: {_raw_n} raw clique group(s) -> "
                   f"{len(bus_groups)} geometric bus(es)")
+        # #622 take2 (user design, KICAD_BUS_PLAN_FROM_BOARD): re-plan the
+        # buses from the COMMITTED fanout -- partition each group by its
+        # members' measured tooth layer and order along the real comb --
+        # so the plan is based on the real fanouts, not anything probed
+        # before a stub existed.
+        if env_knobs.BUS_PLAN_FROM_BOARD and bus_groups:
+            from bus_detection import replan_groups_from_board
+            _n0622 = len(bus_groups)
+            bus_groups, _ = replan_groups_from_board(pcb_data, bus_groups)
+            print(f"  Board bus re-plan: {_n0622} detected group(s) -> "
+                  f"{len(bus_groups)} layer-homogeneous chain(s)")
 
         if bus_groups:
             print(f"\n=== Bus Detection: Found {len(bus_groups)} bus group(s) ===")
@@ -663,8 +674,87 @@ def route_single_ended_nets(
         # planned corridor first (#296 R9), routed-neighbor fallback,
         # clustered-endpoint direction. Multipoint members use it for
         # main-edge selection + attraction too (they used to route blind).
+        # #622 take-2 exact landing legs (KICAD_BUS_EXACT_LEGS=1): a bus
+        # member landing on a BARE ball gets its landing leg emitted as
+        # exact-checked copper BEFORE routing -- a fanout tooth created on
+        # demand (see bus_terminal). The net then has a stub whose free
+        # tip at the field edge becomes the routing target; the search
+        # never enters the ball field.
+        _leg_tip_622 = None
+        _leg_segs_622 = None
+        import os as _el_os
+        if _el_os.environ.get('KICAD_BUS_EXACT_LEGS'):
+            _bg_el = (bus_net_to_group or {}).get(net_id)
+            if _bg_el is not None and net_id in _bg_el.net_ids:
+                _k_el = _bg_el.net_ids.index(net_id)
+                _tgt_el = _bg_el.target_positions[_k_el]
+                _bare = not any(
+                    s.net_id == net_id
+                    and min(abs(s.start_x - _tgt_el[0])
+                            + abs(s.start_y - _tgt_el[1]),
+                            abs(s.end_x - _tgt_el[0])
+                            + abs(s.end_y - _tgt_el[1])) < 1.0
+                    for s in pcb_data.segments)
+                if _bare:
+                    from bus_terminal import emit_landing_leg
+                    _n_el = float(len(_bg_el.net_ids))
+                    _scx = sum(p[0] for p in _bg_el.source_positions) / _n_el
+                    _scy = sum(p[1] for p in _bg_el.source_positions) / _n_el
+                    _el_res = emit_landing_leg(
+                        pcb_data, net_id, _tgt_el, (_scx, _scy), config)
+                    if _el_res is not None:
+                        _tip_el, _leg_segs_622 = _el_res
+                        _bg_el.target_positions[_k_el] = _tip_el
+                        _leg_tip_622 = (_tip_el, (_tgt_el[0], _tgt_el[1]))
         attraction_path, reverse_direction = bus_attraction_context(
             net_id, bus_net_to_group, bus_corridors, bus_routed_paths)
+        # #622 take-2 terminal plan: when follow-leader attraction handed
+        # this member a routed sibling's path, refine it into the
+        # polarity-aware lane target (offset to the member's lane side,
+        # truncated at peel-off, landing leg to its own ball) -- see
+        # bus_detection.terminal_plan_target.
+        _leg_wps_622 = None
+        if attraction_path is not None:
+            import os as _tp_os
+            if _tp_os.environ.get('KICAD_BUS_FOLLOW_LEADER'):
+                _bg_tp = (bus_net_to_group or {}).get(net_id)
+                if _bg_tp is not None:
+                    from bus_detection import (get_attraction_neighbor,
+                                               terminal_plan_target)
+                    _nb_tp = get_attraction_neighbor(
+                        _bg_tp, net_id, bus_routed_paths or {})
+                    if _nb_tp is not None and attraction_path is _nb_tp:
+                        _tp622, _leg_wps_622 = terminal_plan_target(
+                            _bg_tp, net_id, _nb_tp, config, pcb_data) \
+                            or (None, None)
+                        if _tp622:
+                            attraction_path = _tp622
+                            print(f"  Terminal plan: "
+                                  f"{pcb_data.nets[net_id].name} lane "
+                                  f"target ({len(_tp622)} pts) from "
+                                  f"leader path")
+                        else:
+                            print(f"  Terminal plan: "
+                                  f"{pcb_data.nets[net_id].name} "
+                                  f"DEGENERATE -- raw leader path kept")
+                    elif (bus_corridors
+                          and _bg_tp.name in bus_corridors
+                          and attraction_path
+                          is bus_corridors[_bg_tp.name]):
+                        # Leader case: refine the corridor's terminal so
+                        # the leader enters the ball field through the
+                        # gap, never corner-cutting across a sibling's
+                        # ball face.
+                        from bus_detection import terminal_leader_target
+                        _tl622, _leg_wps_622 = terminal_leader_target(
+                            _bg_tp, net_id, attraction_path, config,
+                            pcb_data) or (None, None)
+                        if _tl622:
+                            attraction_path = _tl622
+                            print(f"  Terminal plan: "
+                                  f"{pcb_data.nets[net_id].name} leader "
+                                  f"gap leg ({len(_tl622)} pts) from "
+                                  f"corridor")
         # #589 v2 owner attraction (KICAD_GLOBAL_PLAN_ATTRACT=1): a net
         # with a planned rough corridor and NO bus corridor is attracted
         # to its own plan -- the global->detailed handoff the repulsion-
@@ -683,10 +773,49 @@ def route_single_ended_nets(
                 attraction_path = (_sample_path(_riv) if _riv is not None
                                    else _sample_path(_gp.rough_paths[net_id]))
                 reverse_direction = False
+        # #622 take2 D: record what the search was actually steered by --
+        # KICAD_BUS_DEBUG_ECO=1 draws these on the output board (Eco1 =
+        # planned corridor centerlines, Eco2 = each member's attraction
+        # target path), so packing is verified against drawn intent, not
+        # inferred from copper.
+        if attraction_path is not None:
+            import os as _eo622
+            if _eo622.environ.get('KICAD_BUS_DEBUG_ECO'):
+                _gs622 = config.grid_step
+                _dbg622 = getattr(pcb_data, '_bus_attract_debug', None)
+                if _dbg622 is None:
+                    _dbg622 = {'targets': {}, 'corridors': {}}
+                    setattr(pcb_data, '_bus_attract_debug', _dbg622)
+                _nm622 = pcb_data.nets[net_id].name if net_id in pcb_data.nets \
+                    else str(net_id)
+                _dbg622['targets'][_nm622] = [
+                    (p[0] * _gs622, p[1] * _gs622)
+                    for p in attraction_path[::2]]
+                _bg622 = (bus_net_to_group or {}).get(net_id)
+                if _bg622 is not None and bus_corridors \
+                        and _bg622.name in bus_corridors:
+                    _dbg622['corridors'][_bg622.name] = [
+                        (p[0] * _gs622, p[1] * _gs622)
+                        for p in bus_corridors[_bg622.name][::2]]
         # Off-lane surcharge (the stick): members with a corridor pay
         # scaled step costs everywhere EXCEPT near the lane, where the
         # attraction discount compensates -- defection costs real money.
         cfg_route = bus_stick_config(config, attraction_path)
+        # #622 take-2: the landing leg's corners ride the guide-corridor
+        # WAYPOINT machinery, per-net (best-effort): soft attraction
+        # cannot discriminate a 0.3mm corner-cut inside its 2.5mm radius
+        # (measured: the leader still cut across its sibling's ball face,
+        # e5_2). The trunk stays attraction-driven -- waypoints pin ONLY
+        # the landing. Applied to cfg_route, never the shared config.
+        if _leg_wps_622:
+            from dataclasses import replace as _rep_tp622
+            cfg_route = _rep_tp622(cfg_route,
+                                   corridor_waypoints=list(_leg_wps_622),
+                                   bus_leg_waypoints=True)
+        if _leg_tip_622 is not None:
+            from dataclasses import replace as _rep_el622
+            cfg_route = _rep_el622(cfg_route,
+                                   bus_landing_tip=_leg_tip_622)
         # #589 option 2 (KICAD_GLOBAL_PLAN_LAYER=pref): soft discount on the
         # net's plan-assigned layer so corridor cliques pack N layers deep
         # instead of all fighting for the probes' shared favorite layer.
@@ -765,6 +894,16 @@ def route_single_ended_nets(
             if net_id in remaining_net_ids:
                 remaining_net_ids.remove(net_id)
             routed_net_ids.append(net_id)
+            # #622 take-2 exact landing legs: the emitted leg is part of
+            # this net's ROUTED copper -- merging it into the result makes
+            # the sync keep it, the writer write it, later nets see it as
+            # an obstacle, and the completion verdict credit it (the sync
+            # used to strip it as neither-original-nor-routed, and the
+            # run then reported a FALSE open at the source pad, f4_2).
+            if _leg_segs_622:
+                result['new_segments'] = (list(result['new_segments'])
+                                          + list(_leg_segs_622))
+                _leg_segs_622 = None
             routed_results[net_id] = result
             # Store path for bus attraction (if this net is in a bus)
             if net_id in bus_net_to_group:

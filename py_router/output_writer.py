@@ -195,6 +195,34 @@ def write_routed_output(
             results, exclusion_zone_lines or [], boundary_debug_labels or []
         )
 
+    # #622 take2 D (KICAD_BUS_DEBUG_ECO=1): draw what steered each bus
+    # member -- planned corridor centerlines on User.Eco1 and every
+    # member's attraction TARGET path on User.Eco2 -- so packing is
+    # verified against the drawn intent (awx/render_eco.py overlays
+    # Eco1 white / Eco2 yellow).
+    import os as _eo_os
+    _at_dbg = getattr(pcb_data, '_bus_attract_debug', None) if pcb_data else None
+    if _at_dbg and _eo_os.environ.get('KICAD_BUS_DEBUG_ECO'):
+        from kicad_writer import generate_gr_line_sexpr as _gls622
+        n_eco = 0
+        for _cname, _cp in sorted((_at_dbg.get('corridors') or {}).items()):
+            for _a, _b in zip(_cp, _cp[1:]):
+                if abs(_a[0] - _b[0]) > 1e-4 or abs(_a[1] - _b[1]) > 1e-4:
+                    routing_text += _gls622(
+                        (_a[0], _a[1]), (_b[0], _b[1]), 0.08,
+                        "Eco1.User") + "\n"
+                    n_eco += 1
+        for _tname, _tp in sorted((_at_dbg.get('targets') or {}).items()):
+            for _a, _b in zip(_tp, _tp[1:]):
+                if abs(_a[0] - _b[0]) > 1e-4 or abs(_a[1] - _b[1]) > 1e-4:
+                    routing_text += _gls622(
+                        (_a[0], _a[1]), (_b[0], _b[1]), 0.05,
+                        "Eco2.User") + "\n"
+                    n_eco += 1
+        if n_eco:
+            print(f"Bus attract debug: {n_eco} line(s) on User.Eco1 "
+                  f"(corridors) / User.Eco2 (attraction targets)")
+
     # Insert routing text before final closing paren
     last_paren = content.rfind(')')
     new_content = content[:last_paren] + '\n' + routing_text + '\n' + content[last_paren:]

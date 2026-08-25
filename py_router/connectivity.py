@@ -1112,6 +1112,41 @@ def get_net_endpoints(pcb_data: PCBData, net_id: int, config: GridRouteConfig,
         sources = sorted(sources)
     if targets:
         targets = sorted(targets)
+    # #622 take-2 exact landing legs: pin the TARGET end to the emitted
+    # leg's tip. The leg is real attached copper, so the copper-size-ranked
+    # derivation otherwise re-slots the groups around it (measured: both
+    # route ends resolved on the leg side and the source was never routed).
+    _leg = getattr(config, 'bus_landing_tip', None)
+    if _leg is not None and not err and sources and targets:
+        _tip, _ball = _leg
+        gs = config.grid_step
+        tgx, tgy = int(round(_tip[0] / gs)), int(round(_tip[1] / gs))
+
+        def _leg_d(e):
+            # distance to the leg's tip->ball chord (approximates the leg)
+            x1, y1 = _tip; x2, y2 = _ball
+            dx, dy = x2 - x1, y2 - y1
+            L2 = dx * dx + dy * dy
+            t = 0.0 if L2 <= 0 else max(0.0, min(
+                1.0, ((e[3] - x1) * dx + (e[4] - y1) * dy) / L2))
+            return ((e[3] - (x1 + t * dx)) ** 2
+                    + (e[4] - (y1 + t * dy)) ** 2) ** 0.5
+
+        def _near_leg(lst):
+            return any(_leg_d(e) < 0.6 for e in lst)
+        if _near_leg(sources) and not _near_leg(targets):
+            sources, targets = targets, sources
+        _lay = 0
+        for e in targets:
+            if abs(e[3] - _tip[0]) + abs(e[4] - _tip[1]) < 0.3:
+                _lay = e[2]
+                break
+        targets = [(tgx, tgy, _lay, _tip[0], _tip[1])]
+        sources = [e for e in sources if _leg_d(e) > 0.6]
+        if not sources:
+            sources, targets, err = _get_net_endpoints_ordered(
+                pcb_data, net_id, config, use_stub_free_ends)
+            return sorted(sources), sorted(targets), err
     # Role assignment is left to the derivation below -- see the group-ordering
     # note in _get_net_endpoints_ordered. A blanket "smallest coordinate wins"
     # swap was tried TWICE and regressed both times (CLI 3538 vs GUI 3526/3516):

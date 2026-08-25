@@ -206,6 +206,30 @@ def refresh() -> None:
     g['MULTIPOINT_DENSE_FIRST'] = _opt_in('KICAD_MULTIPOINT_DENSE_FIRST')
     g['FANOUT_DIRECT'] = _opt_in('KICAD_FANOUT_DIRECT')
     g['FANOUT_TOWARD_TARGETS'] = _opt_in('KICAD_FANOUT_TOWARD_TARGETS')
+    # #622 take2 port: pre-fanout probe plan ('alloc' = capacity-aware side
+    # allocation, 'raw' = raw probe dirs, '' = off). Opt-in; carries the
+    # bus-plan layer assignment below when armed.
+    g['FANOUT_PROBE_PLAN'] = _s('KICAD_FANOUT_PROBE_PLAN', '')
+    # #622 take2 port: bus-plan fanout layer assignment (end-matching to
+    # committed facing teeth, group non-interleaving, non-blocking spans --
+    # bga_fanout/layer_plan.py). Default ON but live only while
+    # KICAD_FANOUT_PROBE_PLAN is armed; '0' disables within that arming.
+    g['FANOUT_LAYER_PLAN'] = _s('KICAD_FANOUT_LAYER_PLAN', '1') != '0'
+    # #622: dogbone-side probe-dir consumption (measured HARMFUL solo in
+    # take 1 -- "solo probes don't compose"; kept OPT-IN for A/B only).
+    g['FANOUT_DOGBONE_DIRS'] = _opt_in('KICAD_FANOUT_DOGBONE_DIRS')
+    # #622 dive rescue: when the CHANNEL engine drops balls, keep its comb
+    # and dog-bone-dive ONLY the dropped balls against the committed copper
+    # (the human's overflow move: near-ball via, weave out the back).
+    # '1' on, '0' off, '' (default) = on exactly when
+    # KICAD_FANOUT_PROBE_PLAN is active, so default chains are untouched
+    # pending a corpus screen.
+    g['FANOUT_DIVE_RESCUE'] = _s('KICAD_FANOUT_DIVE_RESCUE', '')
+    # #622 fix A: dog-bone Phase A lane-RUN surface escape for deep
+    # near-edge balls (pad -> 45deg jog -> gap-lane midline -> boundary).
+    # Default ON (measured: U1 55/55 escape, field vias 30 -> 20); '0'
+    # reverts. Corpus screen owed before release.
+    g['FANOUT_LANE_ESCAPE'] = _s('KICAD_FANOUT_LANE_ESCAPE', '1') != '0'
     # '' = follow the --plane-drop param (default auto); '0'/'off' forces the
     # plane-ball drop pass OFF, '1'/'auto' forces it ON -- the manifest-replay
     # A/B switch for #424 D2 (recorded chains carry no flag either way).
@@ -343,6 +367,10 @@ def refresh() -> None:
     g['RASTER_CACHE_MB'] = _f('KICAD_RASTER_CACHE_MB', 256.0)
     g['BUS_XLAYER_PCT'] = _i('KICAD_BUS_XLAYER_PCT', 35)
     g['BUS_OFFLANE_MULT'] = _f('KICAD_BUS_OFFLANE_MULT', 1.0)   # off-lane surcharge (1.0 = off)
+    # #622 take2 (user design): re-plan detected bus groups at route time
+    # from the COMMITTED board -- partition by measured tooth layer, order
+    # along the real comb (bus_detection.replan_groups_from_board). Opt-in.
+    g['BUS_PLAN_FROM_BOARD'] = _opt_in('KICAD_BUS_PLAN_FROM_BOARD')
     g['BUS_CORRIDOR_PROBE_VIA_MULT'] = _f('KICAD_BUS_CORRIDOR_PROBE_VIA_MULT', 20.0)
     g['BUS_MAX_CORRIDOR_LAYER_CHANGES'] = _i('KICAD_BUS_MAX_CORRIDOR_LAYER_CHANGES', 1)
     g['TAP_RELOCATION_MAX'] = _i('KICAD_TAP_RELOCATION_MAX', 2)

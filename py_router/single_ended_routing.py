@@ -1776,6 +1776,10 @@ def route_net_with_obstacles(pcb_data: PCBData, net_id: int, config: GridRouteCo
         except ValueError:
             bus_xlayer_pct = 35
 
+    import os as _vc_os
+    if _vc_os.environ.get('KICAD_DBG_VIACOST'):
+        print(f"    [viacost-dbg] config.via_cost={config.via_cost} "
+              f"units={config.via_cost_units()}")
     router = GridRouter(via_cost=config.via_cost_units(), h_weight=config.heuristic_weight,
                         turn_cost=config.turn_cost, via_proximity_cost=config.via_proximity_cost_int(),
                         vertical_attraction_radius=attraction_radius_grid,
@@ -2850,9 +2854,17 @@ def _route_connection_at_margin(router, obstacles, config, sources, targets, tra
     # given, fall back to the whole corridor (single-segment / 2-pad nets).
     if waypoints is None:
         waypoints = getattr(config, 'corridor_waypoints', None)
-    # Bus routing (single_direction) has its own neighbor attraction; leave it be.
-    if not waypoints or single_direction or not sources or not targets:
+    # Bus routing (single_direction) has its own neighbor attraction; leave it
+    # be -- EXCEPT #622 take-2 terminal-leg waypoints (_bus_leg_waypoints):
+    # those pin only the landing (2 corners), and the trunk attraction and
+    # the leg waypoints are complementary, not competing.
+    if not waypoints or not sources or not targets \
+            or (single_direction
+                and not getattr(config, 'bus_leg_waypoints', False)):
         return direct()
+    if getattr(config, 'bus_leg_waypoints', False):
+        print(f"    leg-waypoints LIVE: {len(waypoints)} corner(s) "
+              f"net {net_id} single_dir={single_direction}")
 
     # Legs use the SAME track_margin the direct route would - inflating it can make
     # a leg unroutable where a direct route succeeds, violating "a corridor never

@@ -2274,6 +2274,87 @@ def _underpad_rip_rescue(footprint, pcb_data, grid, layers, up_kw,
     return tracks, vias_to_add, failed_nets
 
 
+def _channel_dive_rescue(footprint, pcb_data, grid, layers,
+                         track_width, clearance, via_size, via_drill,
+                         exit_margin, diff_pair_patterns, diff_pair_gap,
+                         grid_step, same_net_pad_clearance,
+                         progress_callback, cancel_check,
+                         tracks, vias_to_add, failed_nets):
+    """Dive rescue for balls the CHANNEL engine dropped (#622).
+
+    The channel comb is the formation the bus machinery wants; the wholesale
+    auto retry throws it away to rescue a handful of balls. The human's
+    overflow move on the allwinner DU1 field is the opposite: keep the comb
+    and DIVE the contended nets -- a via near the ball (median 0.79mm from
+    its own ball, 40 in-field vias measured), then weave out on the back
+    layer. This pass reproduces that: the committed channel copper is
+    temp-appended to pcb_data (so the grid escape's obstacle build sees it),
+    and the under-pad engine runs in DOG-BONE mode for ONLY the dropped
+    balls (gap-site vias -- the surface stubs stay clean; via-in-pad is the
+    engine's own fallback when no gap site exists and #581 doesn't forbid
+    it). Leftovers walk the existing fab-floor shrink rescue on the same
+    terms. Strictly additive: rescued balls merge into the channel result,
+    nothing already escaped is touched.
+    """
+    from bga_fanout.underpad import generate_underpad_escape
+    from kicad_parser import Segment as _Seg, Via as _Via
+
+    failed = set(failed_nets)
+    keys = {(p.global_x, p.global_y) for p in footprint.pads
+            if p.net_name in failed}
+    if not keys:
+        return tracks, vias_to_add, failed_nets
+    up_diff_pairs = (find_differential_pairs(footprint, diff_pair_patterns)
+                     if diff_pair_patterns else {})
+    up_diff_pairs = {k: v for k, v in up_diff_pairs.items()
+                     if (v.p_pad and v.p_pad.net_name in failed)
+                     or (v.n_pad and v.n_pad.net_name in failed)}
+    kw = dict(track_width=track_width, clearance=clearance,
+              via_size=via_size, via_drill=via_drill,
+              exit_margin=exit_margin, net_filter_fn=None,
+              diff_pairs=up_diff_pairs, diff_pair_gap=diff_pair_gap,
+              grid_step=grid_step, only_pad_keys=keys, dogbone=True,
+              no_via_in_pad=(same_net_pad_clearance is not None
+                             and same_net_pad_clearance > 0),  # #581
+              verbose=False,
+              progress_callback=progress_callback,
+              cancel_check=cancel_check)
+    if progress_callback:
+        progress_callback(0, 0,
+                          f"BGA fanout {getattr(footprint, 'reference', '?')}: "
+                          f"dive rescue of {len(failed)} dropped ball(s)...")
+    n_seg0, n_via0 = len(pcb_data.segments), len(pcb_data.vias)
+    try:
+        for t in tracks:
+            pcb_data.segments.append(_Seg(
+                start_x=t['start'][0], start_y=t['start'][1],
+                end_x=t['end'][0], end_y=t['end'][1],
+                width=t['width'], layer=t['layer'], net_id=t['net_id']))
+        for v in vias_to_add:
+            pcb_data.vias.append(_Via(
+                x=v['x'], y=v['y'], size=v['size'], drill=v['drill'],
+                layers=v.get('layers') or ['F.Cu', 'B.Cu'],
+                net_id=v['net_id']))
+        t2, v2, f2 = generate_underpad_escape(
+            footprint, pcb_data, grid, layers, **kw)
+    finally:
+        del pcb_data.segments[n_seg0:]
+        del pcb_data.vias[n_via0:]
+    rescued = failed - set(f2)
+    print(f"  Dive rescue (#622): {len(rescued)} of {len(failed)} dropped "
+          f"ball(s) escaped by dog-bone dive alongside the kept channel comb"
+          + (f"; still dropped: {sorted(set(f2))}" if f2 else ""))
+    if rescued:
+        tracks = tracks + t2
+        vias_to_add = vias_to_add + v2
+        failed_nets = [n for n in failed_nets if n not in rescued]
+    if failed_nets:
+        tracks, vias_to_add, failed_nets = _underpad_shrink_rescue(
+            footprint, pcb_data, grid, layers, kw,
+            tracks, vias_to_add, failed_nets)
+    return tracks, vias_to_add, failed_nets
+
+
 def _generate_bga_fanout_core(footprint: Footprint,
                         pcb_data: PCBData,
                         net_filter: Optional[List[str]] = None,
@@ -2415,6 +2496,11 @@ def _generate_bga_fanout_core(footprint: Footprint,
         print(f"  .kicad_dru: fanout clearance floored {clearance} -> {_mx_498} "
               f"(largest per-layer rule on the escape layers, #498)")
         clearance = _mx_498
+
+    # #622 probe-plan state is per top-level call: the report belongs to this
+    # run only, and the id()-keyed cache must never outlive its board object.
+    LAST_BUS_PLAN_REPORT.clear()
+    _PROBE_PLAN_CACHE.clear()
 
     from bga_fanout.rotate_frame import (is_orthogonal, to_axis_aligned_frame,
                                          back_transform_results)
@@ -2895,6 +2981,43 @@ def _generate_bga_fanout_core(footprint: Footprint,
                                      or (v.n_pad and v.n_pad.net_name in _direct_route_nets))}
         if up_diff_pairs:
             print(f"  Found {len(up_diff_pairs)} differential pair(s) to escape coupled")
+        # #622 take2 port: probe plan + bus-plan layer assignment for the
+        # dog-bone engine. This is usually the SECOND fanout, so the facing
+        # comb's committed teeth fix most nets (end-matching); planned
+        # non-top nets skip the Phase A surface escape and dive. Probe DIRS
+        # consumption stays OPT-IN (KICAD_FANOUT_DOGBONE_DIRS -- measured
+        # harmful solo in take 1); groups/pad_dirs publish regardless. NO
+        # bus_orders report here: a second comb's orders gave rivers two
+        # competing sequences (measured at K=30, take 1).
+        _up_probe_dirs = None
+        _up_layer_plan = None
+        _pp_mode_up = (env_knobs.FANOUT_PROBE_PLAN or '').strip().lower()
+        if _pp_mode_up in ('0', 'off'):
+            _pp_mode_up = ''
+        if _pp_mode_up and escape_method == 'dogbone' and not _single_pass:
+            from bga_fanout.probe_plan import build_fanout_probe_plan
+            _pp_key = (id(pcb_data), footprint.reference)
+            if _pp_key not in _PROBE_PLAN_CACHE:
+                _PROBE_PLAN_CACHE[_pp_key] = build_fanout_probe_plan(
+                    footprint, pcb_data, net_filter, layers, track_width,
+                    clearance, via_size, via_drill)
+            _up_plan = _PROBE_PLAN_CACHE[_pp_key]
+            if _up_plan is not None:
+                if env_knobs.FANOUT_DOGBONE_DIRS:
+                    _up_probe_dirs = dict(_up_plan.pad_dirs)
+                if env_knobs.FANOUT_LAYER_PLAN:
+                    from bga_fanout.layer_plan import build_fanout_layer_plan
+                    _up_pair_nids = set()
+                    for _pr in up_diff_pairs.values():
+                        for _pp in (_pr.p_pad, _pr.n_pad):
+                            if _pp is not None and _pp.net_id > 0:
+                                _up_pair_nids.add(_pp.net_id)
+                    _up_layer_plan = build_fanout_layer_plan(
+                        _up_plan, pcb_data, grid, layers, {}, _up_pair_nids)
+                    if _up_layer_plan is not None:
+                        _up_plan.report['layer_plan'] = _up_layer_plan.report
+                LAST_BUS_PLAN_REPORT.clear()
+                LAST_BUS_PLAN_REPORT.update(_up_plan.report)
         _up_kw = dict(
             track_width=track_width, clearance=clearance,
             via_size=via_size, via_drill=via_drill, exit_margin=exit_margin,
@@ -2903,6 +3026,9 @@ def _generate_bga_fanout_core(footprint: Footprint,
             grid_step=grid_step,
             only_pad_keys=_pad_filter,
             dogbone=(escape_method == 'dogbone'),
+            probe_dirs=_up_probe_dirs,          # #622 take2 port
+            planned_layers=(_up_layer_plan.net_layer
+                            if _up_layer_plan is not None else None),  # #622
             no_via_in_pad=(same_net_pad_clearance is not None
                            and same_net_pad_clearance > 0),  # #581
             # Rides _up_kw so the shrink rescue's re-run reports too.
@@ -3180,6 +3306,107 @@ def _generate_bga_fanout_core(footprint: Footprint,
                 print(f"  Target-side escape preference active for "
                       f"{len(_toward_targets)} pad(s)")
 
+        # Pre-fanout probe plan (#622 take2 port, KICAD_FANOUT_PROBE_PLAN):
+        # solo-A* each modelable net on the unfanned board, then a
+        # CAPACITY-AWARE side allocation of the realized directions (mode
+        # 'alloc'; 'raw' keeps the unallocated overlay -- measured 50/56 ->
+        # 22/56 escapes in take 1: solo probes don't compose). The executed
+        # plan is published in JSON_SUMMARY 'bus_plan'.
+        _probe_plan = None
+        _fanout_layer_plan = None   # #622 bus-plan layer assignment
+        _pp_mode = (env_knobs.FANOUT_PROBE_PLAN or '').strip().lower()
+        if _pp_mode in ('0', 'off'):
+            _pp_mode = ''
+        if _pp_mode:
+            from bga_fanout.probe_plan import build_fanout_probe_plan
+            _pp_key = (id(pcb_data), footprint.reference)
+            if _pp_key not in _PROBE_PLAN_CACHE:
+                _PROBE_PLAN_CACHE[_pp_key] = build_fanout_probe_plan(
+                    footprint, pcb_data, net_filter, layers, track_width,
+                    clearance, via_size, via_drill)
+            _probe_plan = _PROBE_PLAN_CACHE[_pp_key]
+            if _probe_plan is not None:
+                if _pp_mode == 'raw':
+                    _pp_alloc = dict(_probe_plan.pad_dirs)
+                else:
+                    from bga_fanout.probe_plan import (
+                        allocate_escape_sides, report_bus_orders)
+                    _pp_alloc = allocate_escape_sides(
+                        _probe_plan, grid, channels, layers,
+                        pair_assignments=pass_escape_assignments)
+                    report_bus_orders(_probe_plan, grid)
+                # #622 bus-plan layer assignment: end-matching + group
+                # non-interleaving + non-blocking spans, solved over the
+                # probe plan (see bga_fanout/layer_plan.py). The assigner
+                # seeds from it and rebalance pins its nets.
+                if env_knobs.FANOUT_LAYER_PLAN:
+                    from bga_fanout.layer_plan import build_fanout_layer_plan
+                    _pair_nids = {p.net_id for p in footprint.pads
+                                  if p.net_name and p.net_name in net_to_pair}
+                    _fanout_layer_plan = build_fanout_layer_plan(
+                        _probe_plan, pcb_data, grid, layers,
+                        _pp_alloc or {}, _pair_nids)
+                    # #622 lever 2: wall-aware side re-allocation. The
+                    # solve's conflicted UN-COMMITTED units retry on their
+                    # second-nearest side through the same grant-or-natural
+                    # allocator (capacity still gates every grant), adopted
+                    # only when conflicts strictly drop -- the human board
+                    # sends nearly this exact net list out other faces.
+                    if (_fanout_layer_plan is not None
+                            and _fanout_layer_plan.reside_candidates
+                            and _pp_mode != 'raw'):
+                        def _sdist(bx, by, s):
+                            return {'left': bx - grid.min_x,
+                                    'right': grid.max_x - bx,
+                                    'up': by - grid.min_y,
+                                    'down': grid.max_y - by}[s]
+                        _ovr = {}
+                        for _nid in _fanout_layer_plan.reside_candidates:
+                            _bp = _probe_plan.ball_pos.get(_nid)
+                            if _bp is None:
+                                continue
+                            _k = (round(_bp[0], 3), round(_bp[1], 3))
+                            _cur = (_pp_alloc or {}).get(_k) \
+                                or _probe_plan.pad_dirs.get(_k)
+                            _alts = sorted(
+                                (s for s in ('left', 'right', 'up', 'down')
+                                 if s != _cur),
+                                key=lambda s: _sdist(_bp[0], _bp[1], s))
+                            if _alts:
+                                _ovr[_k] = _alts[0]
+                        _v0 = len(_fanout_layer_plan.report.get(
+                            'violations', []))
+                        if _ovr and _v0:
+                            _sa_keep = _probe_plan.report.get('side_alloc')
+                            _alloc2 = allocate_escape_sides(
+                                _probe_plan, grid, channels, layers,
+                                pair_assignments=pass_escape_assignments,
+                                prefer_overrides=_ovr)
+                            _plan2 = build_fanout_layer_plan(
+                                _probe_plan, pcb_data, grid, layers,
+                                _alloc2 or {}, _pair_nids, verbose=False)
+                            _v2 = len(_plan2.report.get('violations', [])) \
+                                if _plan2 is not None else _v0
+                            if _plan2 is not None and _v2 < _v0:
+                                print(f"  Fanout layer-plan: side "
+                                      f"re-allocation adopted -- conflicts "
+                                      f"{_v0} -> {_v2} ({len(_ovr)} net(s) "
+                                      f"offered a new side)")
+                                _fanout_layer_plan = _plan2
+                                _pp_alloc = _alloc2
+                            else:
+                                _probe_plan.report['side_alloc'] = _sa_keep
+                                print(f"  Fanout layer-plan: side "
+                                      f"re-allocation NOT adopted "
+                                      f"(conflicts {_v0} -> {_v2})")
+                    if _fanout_layer_plan is not None:
+                        _probe_plan.report['layer_plan'] = \
+                            _fanout_layer_plan.report
+                if _pp_alloc:
+                    _toward_targets = {**_toward_targets, **_pp_alloc}
+                LAST_BUS_PLAN_REPORT.clear()
+                LAST_BUS_PLAN_REPORT.update(_probe_plan.report)
+
         for pad in footprint.pads:
             if not pad.net_name or pad.net_id == 0:
                 continue
@@ -3261,7 +3488,10 @@ def _generate_bga_fanout_core(footprint: Footprint,
 
         # Smart layer assignment (keeps diff pairs together, avoids existing tracks)
         _prog(f"assigning layers to {len(routes)} route(s)...")
-        assign_layers_smart(routes, layers, track_width, clearance, diff_pair_gap, existing_tracks, no_inner_top_layer)
+        _planned_map = (_fanout_layer_plan.net_layer
+                        if _fanout_layer_plan is not None else None)
+        assign_layers_smart(routes, layers, track_width, clearance, diff_pair_gap, existing_tracks, no_inner_top_layer,
+                            planned_layers=_planned_map)
 
         # Calculate jog length = distance from BGA edge to first pad row/col
         # This is half the pitch (since edge is pitch/2 from first pad)
@@ -3322,9 +3552,30 @@ def _generate_bga_fanout_core(footprint: Footprint,
         # (soon-to-be-plane) layers keep only the greedy pass's overflow (#288).
         if collisions_remaining == 0 and len(balance_layers) > 1 \
                 and not _ignore_prefanned:  # pass-2 extras keep their validated layers (#129)
-            rebalanced_count = rebalance_layers(routes, tracks, existing_tracks, balance_layers, min_spacing)
+            rebalanced_count = rebalance_layers(routes, tracks, existing_tracks, balance_layers, min_spacing,
+                                                pinned_net_ids=(set(_planned_map) if _planned_map else None))
             if rebalanced_count > 0:
                 print(f"  Rebalanced {rebalanced_count} routes for even layer distribution")
+
+        # #622 layer-plan violation audit: collision resolution and the
+        # fallback paths may lawfully move a planned net (never-fail
+        # doctrine) -- but never silently. The committed copper is what the
+        # facing fanout will end-match, so name every divergence.
+        if _planned_map:
+            _lp_names = {r.net_id: r.pad.net_name for r in routes
+                         if r.pad.net_name}
+            _lp_viol = [(r.net_id, r.layer) for r in routes
+                        if r.net_id in _planned_map
+                        and r.layer is not None
+                        and r.layer != _planned_map[r.net_id]]
+            for _nid, _lay in _lp_viol:
+                print(f"  layer-plan VIOLATION: "
+                      f"{_lp_names.get(_nid, f'net_{_nid}')} committed on "
+                      f"{_lay}, planned {_planned_map[_nid]} "
+                      f"(collision/fallback)")
+            if _fanout_layer_plan is not None:
+                _fanout_layer_plan.report['committed_violations'] = [
+                    _lp_names.get(n, str(n)) for n, _ in _lp_viol]
 
         # NOTE: pad-aware repair runs ONCE on the selected best result (after the
         # orthogonal re-escape retry loop below), not per-pass: repairing inside
@@ -3516,6 +3767,27 @@ def _generate_bga_fanout_core(footprint: Footprint,
               f"would short a foreign track (issue #123); retry with smaller "
               f"--via-size / --track-width / --clearance")
 
+    # #622 dive rescue: BEFORE the wholesale auto retry gets to throw the
+    # channel comb away, try to keep it and dog-bone-dive only the dropped
+    # balls (the human's overflow move). If it rescues everything, the auto
+    # retry below never fires and the comb ships. Gated: KICAD_FANOUT_DIVE_
+    # RESCUE '1' on / '0' off / '' follows KICAD_FANOUT_PROBE_PLAN (the
+    # #622 arm) -- default chains keep today's behavior pending a corpus
+    # screen.
+    _dr = (env_knobs.FANOUT_DIVE_RESCUE or '').strip().lower()
+    _dive_on = (_dr not in ('', '0', 'off')) if _dr else bool(
+        (env_knobs.FANOUT_PROBE_PLAN or '').strip().lower()
+        not in ('', '0', 'off'))
+    if failed_nets and _dive_on and not _single_pass \
+            and escape_method in ('auto', 'channel'):
+        tracks, vias_to_add, failed_nets = _channel_dive_rescue(
+            footprint, pcb_data, grid, layers,
+            track_width, clearance, via_size, via_drill,
+            exit_margin, diff_pair_patterns, diff_pair_gap,
+            grid_step, same_net_pad_clearance,
+            progress_callback, cancel_check,
+            tracks, vias_to_add, failed_nets)
+
     # Under-pad auto-fallback (issue #288). On dense/locked-neighbour arrays the
     # channel engine deterministically drops balls the grid escapes handle
     # (ecp5_mini HyperRAM 11/14 -> 14/14, icepi_zero ECP5 120/124 ->
@@ -3653,6 +3925,19 @@ def _generate_bga_fanout_core(footprint: Footprint,
 # Per-call report of the plane-ball drop pass (#424 D2), for JSON_SUMMARY /
 # the GUI results panel. Refreshed by every top-level generate_bga_fanout call.
 LAST_PLANE_DROP_REPORT: Dict = {}
+
+# Per-call report of the pre-fanout probe plan (#622 take2 port,
+# KICAD_FANOUT_PROBE_PLAN): probed nets, bus groups, applied escape
+# directions, comb orders, and the bus-plan layer assignment. Published into
+# JSON_SUMMARY as 'bus_plan'. Refreshed by every top-level
+# generate_bga_fanout call; empty = pass off or nothing modelable.
+LAST_BUS_PLAN_REPORT: Dict = {}
+
+# Probe plans are expensive (one solo A* per candidate net); the core
+# recurses (escape-priority passes, the auto retry, the rotated frame), so
+# cache per (board object, component). Cleared at every public
+# generate_bga_fanout entry -- the id() key must never outlive its board.
+_PROBE_PLAN_CACHE: Dict = {}
 
 # #621: balls whose escape was never ATTEMPTED because this run's own
 # `cancel_check` stopped it -- in practice the GUI's Cancel button or the plan
@@ -4368,6 +4653,10 @@ def main():
         # #424 D2: per-net plane-ball drop counts (gap/in_pad/existing/failed);
         # empty when the pass is off or the part has no plane balls.
         'plane_drop': dict(LAST_PLANE_DROP_REPORT),
+        # #622: the pre-fanout probe plan this run executed (bus groups,
+        # realized escape directions, comb orders, layer plan). Empty when
+        # KICAD_FANOUT_PROBE_PLAN is off or nothing was modelable.
+        'bus_plan': dict(LAST_BUS_PLAN_REPORT),
     }
     try:                       # #653: env knobs into the machine-readable
         import env_knobs as _ek653   # summary, so a harness can detect a

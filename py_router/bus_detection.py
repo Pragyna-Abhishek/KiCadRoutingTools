@@ -39,6 +39,11 @@ def detect_bus_groups(
     net_ids: List[int],
     detection_radius: float = 2.0,
     min_nets: int = 2,
+    endpoint_override: Optional[Dict[int, Tuple[Tuple[float, float],
+                                                Tuple[float, float]]]] = None,
+    endpoint_dirs: Optional[Dict[int, Tuple[Optional[Tuple[float, float]],
+                                            Optional[Tuple[float, float]]]]]
+    = None,
 ) -> List[BusGroup]:
     """
     Detect bus groups by finding nets where EITHER all sources are within radius
@@ -54,13 +59,54 @@ def detect_bus_groups(
     Returns:
         List of BusGroup objects, each containing nets that form a bus
     """
-    # Get endpoints for each net
+    # Get endpoints for each net. #622 (take2 port, minimal): a caller with
+    # REALIZED attach geometry (the fanout probe plan's solo-A* endpoints)
+    # may override the derived endpoints per net; `endpoint_dirs` (approach
+    # vectors) is accepted for interface parity with the probe plan but not
+    # consumed by this detection -- the take-1 dirs-aware clique refinement
+    # was deliberately NOT carried.
+    del endpoint_dirs
     net_endpoints: Dict[int, Tuple[Tuple[float, float], Tuple[float, float]]] = {}
 
     for net_id in net_ids:
+        if endpoint_override and net_id in endpoint_override:
+            net_endpoints[net_id] = endpoint_override[net_id]
+            continue
         endpoints = get_net_routing_endpoints(pcb_data, net_id)
         if len(endpoints) >= 2:
             net_endpoints[net_id] = (endpoints[0], endpoints[1])
+
+    # Slot canonicalization (#622, take-2 -- found by the take-1 K=4
+    # microscope and REDISCOVERED at take-2 K=2): the (source, target) ORDER
+    # coming out of get_net_routing_endpoints is per-net arbitrary (its
+    # Case-1 ranks stub groups by copper size), so neighboring nets of one
+    # physical bus can arrive with opposite orientation. The cliquer
+    # compares slot-to-slot, so mixed orientation scatters "sources" across
+    # both ends of the bus: detection finds NOTHING at K=2 (SDQ4 U1-first,
+    # SDQ1 DU1-first -- measured: no group, no attraction, two independent
+    # routes), and silently fragments larger sets into orientation-pure
+    # subsets. Orientation is DENSITY-based (user rule): source = the end
+    # in the denser pad field, so routing starts from the constrained
+    # (fanned BGA) side and escapes toward the forgiving side. Ties fall
+    # back to the lexicographically smaller endpoint -- deterministic
+    # either way, no thresholds.
+    _all_pads = [p for fp in pcb_data.footprints.values() for p in fp.pads]
+    _dens_cache: Dict[Tuple[float, float], int] = {}
+
+    def _pad_density(pt):
+        k = (round(pt[0], 1), round(pt[1], 1))
+        if k not in _dens_cache:
+            _dens_cache[k] = sum(
+                1 for p in _all_pads
+                if abs(p.global_x - pt[0]) <= 3.0
+                and abs(p.global_y - pt[1]) <= 3.0)
+        return _dens_cache[k]
+
+    for _nid, (_sa, _sb) in list(net_endpoints.items()):
+        _da, _db = _pad_density(_sa), _pad_density(_sb)
+        if _db > _da or (_da == _db
+                         and (_sb[0], _sb[1]) < (_sa[0], _sa[1])):
+            net_endpoints[_nid] = (_sb, _sa)
 
     if len(net_endpoints) < min_nets:
         return []
@@ -262,6 +308,30 @@ def get_bus_routing_order(bus: BusGroup) -> List[int]:
     if n == 1:
         return list(bus.net_ids)
 
+    # #622 take-2 (KICAD_BUS_FOLLOW_LEADER): DEEPEST-TARGET-FIRST. The
+    # terminal plan lands members in target-depth order, and that only
+    # works if the deep member routes before the shallow one -- measured:
+    # with the shallow sibling routed first, its landing copper + ball
+    # blocked the deep member's surface path and forced a 2-via tunnel
+    # (e3_2 SDQ0); deep-first, the shallow member lands short of the
+    # deep one's copper for free. Also how a human fills a comb.
+    import os as _do_os
+    if _do_os.environ.get('KICAD_BUS_FOLLOW_LEADER'):
+        import math as _do_m
+        n_ = float(n)
+        scx = sum(p[0] for p in bus.source_positions) / n_
+        scy = sum(p[1] for p in bus.source_positions) / n_
+        tcx = sum(p[0] for p in bus.target_positions) / n_
+        tcy = sum(p[1] for p in bus.target_positions) / n_
+        tvx, tvy = tcx - scx, tcy - scy
+        L = _do_m.hypot(tvx, tvy) or 1.0
+        tvx, tvy = tvx / L, tvy / L
+        return [nid for _, nid in sorted(
+            ((bus.target_positions[i][0] * tvx
+              + bus.target_positions[i][1] * tvy, nid)
+             for i, nid in enumerate(bus.net_ids)),
+            reverse=True)]
+
     middle = n // 2
     order = [bus.net_ids[middle]]
 
@@ -314,7 +384,7 @@ def get_attraction_neighbor(
 
 
 def filter_bus_groups_geometric(pcb_data, bus_groups, config,
-                                min_members: int = 3,
+                                min_members: int = 2,
                                 min_run_mm: float = 5.0,
                                 cos_cone: float = 0.9,
                                 max_len_ratio: float = 1.5):
@@ -322,8 +392,10 @@ def filter_bus_groups_geometric(pcb_data, bus_groups, config,
     reverts to raw clique detection): a group is a bus only if its members
     genuinely TRAVEL TOGETHER. Five rules, no names, no component identity:
 
-      1. >=3 members (pairs belong to the diff router or aren't worth
-         bundling),
+      1. >=2 members (#622 take2: a 2-net co-traveling pair IS a bus --
+         the human packs pairs too, and the K=2 microscope is the
+         campaign's acceptance test; was 3 -- short/incoherent pairs are
+         still killed by rules 2-5),
       2. parallel travel: member displacement vectors within a cos>0.9
          cone at length ratio <=1.5 (largest coherent subset kept --
          clustered sources + this cone geometrically imply clustered
@@ -376,6 +448,103 @@ def filter_bus_groups_geometric(pcb_data, bus_groups, config,
     return out
 
 
+def net_teeth_common_layer(pcb_data, net_id) -> Optional[str]:
+    """The single layer shared by ALL of the net's pre-existing free stub
+    tips (degree-1 segment endpoints not anchored at same-net pads/vias),
+    or None when the net has no stubs or its tips span layers. Board
+    geometry is the honest source (#622: published plans lied twice); a
+    via-in-pad + stub tooth reads as its stub's layer -- exactly the layer
+    a trunk to this net must ride to attach."""
+    from collections import Counter as _Counter
+    segs = [s for s in pcb_data.segments if s.net_id == net_id]
+    if not segs:
+        return None
+    deg = _Counter()
+    for s in segs:
+        deg[(round(s.start_x, 3), round(s.start_y, 3))] += 1
+        deg[(round(s.end_x, 3), round(s.end_y, 3))] += 1
+    # Tight anchor radius: fanout-authored geometry is exact, and a short
+    # tooth's real tip can sit < 0.1mm past its own dog-bone via (take-1
+    # measured: 0.15 swallowed a 0.088mm tip and returned None for exactly
+    # the net that needed the answer).
+    anchors = [(p.global_x, p.global_y)
+               for p in pcb_data.pads_by_net.get(net_id, [])]
+    anchors += [(v.x, v.y) for v in pcb_data.vias if v.net_id == net_id]
+
+    def _anchored(x, y):
+        return any((x - ax) ** 2 + (y - ay) ** 2 < 0.05 ** 2
+                   for ax, ay in anchors)
+    tip_layers = set()
+    n_tips = 0
+    for s in segs:
+        for pt in ((round(s.start_x, 3), round(s.start_y, 3)),
+                   (round(s.end_x, 3), round(s.end_y, 3))):
+            if deg[pt] == 1 and not _anchored(pt[0], pt[1]):
+                tip_layers.add(s.layer)
+                n_tips += 1
+    if n_tips < 2 or len(tip_layers) != 1:
+        return None
+    return next(iter(tip_layers))
+
+
+def replan_groups_from_board(pcb_data, bus_groups):
+    """#622 take2 (user design, KICAD_BUS_PLAN_FROM_BOARD): re-derive each
+    detected group's bus structure at ROUTE time from the COMMITTED board --
+    the real fanout teeth -- instead of anything planned before the fanout
+    ran. Members partition by their MEASURED tooth layer (a member with no
+    or mixed-layer teeth becomes a singleton and routes plain), and each
+    layer class becomes its own group ordered along the entry comb (the
+    projection of member positions on the perpendicular of the group's
+    travel direction). Layer-homogeneous buses in measured comb order, by
+    construction. Returns (new_groups, rank_map) where rank_map is
+    net_id -> (chain, rank, layer), stashed on pcb_data._board_bus_rank."""
+    import math as _m
+    out = []
+    rank_map = {}
+    chain_no = 0
+    for g in bus_groups:
+        lay_of = {nid: net_teeth_common_layer(pcb_data, nid)
+                  for nid in g.net_ids}
+        classes: Dict[Optional[str], List[int]] = {}
+        for k, nid in enumerate(g.net_ids):
+            classes.setdefault(lay_of[nid], []).append(k)
+        n = len(g.net_ids)
+        sc = (sum(p[0] for p in g.source_positions) / n,
+              sum(p[1] for p in g.source_positions) / n)
+        tc = (sum(p[0] for p in g.target_positions) / n,
+              sum(p[1] for p in g.target_positions) / n)
+        tv = (tc[0] - sc[0], tc[1] - sc[1])
+        L = _m.hypot(*tv) or 1.0
+        perp = (-tv[1] / L, tv[0] / L)
+        for lay, ks in sorted(classes.items(),
+                              key=lambda t: (t[0] is None, str(t[0]))):
+            if lay is None:
+                for k in ks:
+                    out.append(BusGroup(
+                        name=f"{g.name}m{chain_no}",
+                        net_ids=[g.net_ids[k]],
+                        source_positions=[g.source_positions[k]],
+                        target_positions=[g.target_positions[k]],
+                        clique_endpoint=g.clique_endpoint))
+                    chain_no += 1
+                continue
+            ks_sorted = sorted(ks, key=lambda k: (
+                g.source_positions[k][0] * perp[0]
+                + g.source_positions[k][1] * perp[1]))
+            ng = BusGroup(
+                name=f"{g.name}c{chain_no}",
+                net_ids=[g.net_ids[k] for k in ks_sorted],
+                source_positions=[g.source_positions[k] for k in ks_sorted],
+                target_positions=[g.target_positions[k] for k in ks_sorted],
+                clique_endpoint=g.clique_endpoint)
+            out.append(ng)
+            for r, k in enumerate(ks_sorted):
+                rank_map[g.net_ids[k]] = (chain_no, r, lay)
+            chain_no += 1
+    setattr(pcb_data, '_board_bus_rank', rank_map)
+    return out, rank_map
+
+
 def bus_stick_config(config, attraction_path):
     """Off-lane surcharge (the STICK, KICAD_BUS_OFFLANE_MULT, default 1.0
     = off): a bus member with a planned corridor routes with every layer's
@@ -399,6 +568,185 @@ def bus_stick_config(config, attraction_path):
     return _replace(config, layer_costs=scaled)
 
 
+def terminal_plan_target(bg: BusGroup, net_id: int,
+                         leader_path: List[Tuple[int, int, int]],
+                         config, pcb_data=None
+                         ) -> Optional[List[Tuple[int, int, int]]]:
+    """#622 take-2 terminal approach plan (user design, polarity-aware).
+
+    The follower's attraction target is not the leader's path itself but
+    the leader's REALIZED path offset one pack pitch onto the follower's
+    LANE SIDE, truncated at the peel-off point, plus a straight landing
+    leg to the follower's own target ball. The lane side is chosen by the
+    TARGET (the side of the leader's path the follower's ball lies on
+    near the terminal), so the destination end is clean by construction
+    -- measured without this: both targets in one ball column, the pack's
+    lane order inverted against target depth, and the deep member paid 2
+    terminal vias tunneling around its sibling's ball (e1_2, SDQ0).
+
+    POLARITY: when the follower's SOURCE lies on the other side of the
+    leader than its target, the crossing is topologically forced (Jordan
+    -- no lane assignment removes it); the offset then ramps in over the
+    first ~2mm so the swap happens AT THE MOUTH, where teeth are spread
+    and it is cheap, never mid-span and never at the destination.
+    Returns None when the geometry is degenerate (target = attraction
+    stays the raw leader path)."""
+    import math as _m
+    if not leader_path or len(leader_path) < 4 \
+            or net_id not in bg.net_ids:
+        return None
+    gs = config.grid_step
+    k = bg.net_ids.index(net_id)
+    src = bg.source_positions[k]
+    tgt = bg.target_positions[k]
+    sxy = (src[0] / gs, src[1] / gs)
+    txy = (tgt[0] / gs, tgt[1] / gs)
+    pts = list(leader_path)
+    # Orient the leader path so its END is the terminal (nearer the
+    # member's target) -- routed path orientation is not guaranteed.
+    d0 = (pts[0][0] - txy[0]) ** 2 + (pts[0][1] - txy[1]) ** 2
+    d1 = (pts[-1][0] - txy[0]) ** 2 + (pts[-1][1] - txy[1]) ** 2
+    if d0 < d1:
+        pts = pts[::-1]
+    peel = min(range(len(pts)),
+               key=lambda i: (pts[i][0] - txy[0]) ** 2
+               + (pts[i][1] - txy[1]) ** 2)
+    # Back the peel off ~1.5 ball pitches so the gap leg owns the final
+    # approach (same rule as the leader's terminal refinement).
+    _bp = local_ball_pitch(pcb_data, tgt) if pcb_data is not None else 0.0
+    if _bp > 0:
+        _back = 1.5 * _bp / gs
+        while peel > 3 and ((pts[peel][0] - txy[0]) ** 2
+                            + (pts[peel][1] - txy[1]) ** 2) < _back * _back:
+            peel -= 1
+    if peel < 3:
+        return None
+
+    def _tang(i):
+        a = pts[max(0, i - 3)]
+        b = pts[min(len(pts) - 1, i + 3)]
+        vx, vy = b[0] - a[0], b[1] - a[1]
+        L = _m.hypot(vx, vy) or 1.0
+        return vx / L, vy / L
+
+    # Lane side = side of the leader the follower's BALL lies on at the
+    # peel point (left-normal dot); source side likewise at the start.
+    txp, typ = _tang(peel)
+    _st = (txy[0] - pts[peel][0]) * (-typ) + (txy[1] - pts[peel][1]) * txp
+    s_t = 1.0 if _st >= 0 else -1.0
+    tx0, ty0 = _tang(0)
+    _ss = (sxy[0] - pts[0][0]) * (-ty0) + (sxy[1] - pts[0][1]) * tx0
+    s_s = 1.0 if _ss >= 0 else -1.0
+    pitch = max(1.0, (config.track_width + config.clearance) / gs)
+    # Polarity mismatch -> longer ramp: the forced swap lands at the mouth.
+    ramp = 20 if s_s != s_t else 8
+    out: List[Tuple[int, int, int]] = []
+    for i in range(peel + 1):
+        txi, tyi = _tang(i)
+        f = min(1.0, i / float(ramp))
+        off = pitch * s_t * f
+        out.append((int(round(pts[i][0] - tyi * off)),
+                    int(round(pts[i][1] + txi * off)),
+                    pts[i][2]))
+    _corners: List[Tuple[int, int]] = []
+    _append_landing_leg(out, txy, config, pcb_data,
+                        ball_pitch_mm=_bp, corners_out=_corners)
+    return out, _corners
+
+
+def _append_landing_leg(out, txy, config, pcb_data=None,
+                        ball_pitch_mm: float = 0.0,
+                        corners_out: Optional[List[Tuple[int, int]]] = None):
+    """Gap-aware landing leg (#622 take-2): from the current target end,
+    run LATERALLY to the ball's gap column (half a ball pitch to the side
+    nearer the approach), then AXIS-ALIGNED along the gap to the ball's
+    row, then jog onto the ball -- the human's straight column run. A
+    diagonal corner-cut leg crosses the neighboring ball's face and
+    walls the sibling that lands there (measured: e4_2 SDQ2 paid 2 vias
+    hopping around the leader's corner-cut). Falls back to the straight
+    leg when no pitch is known."""
+    lx, ly, ll = out[-1]
+    gp = ball_pitch_mm / config.grid_step if ball_pitch_mm > 0 else 0.0
+    dx, dy = txy[0] - lx, txy[1] - ly
+    if gp >= 2.0:
+        # entry axis = dominant approach component; lateral = the other
+        if abs(dy) >= abs(dx):
+            gx_ = txy[0] - (gp / 2.0 if lx <= txy[0] else -gp / 2.0)
+            wp = [(gx_, ly), (gx_, txy[1])]
+        else:
+            gy_ = txy[1] - (gp / 2.0 if ly <= txy[1] else -gp / 2.0)
+            wp = [(lx, gy_), (txy[0], gy_)]
+        pts = [(lx, ly)] + wp + [txy]
+        if corners_out is not None:
+            corners_out.extend((int(round(px_)), int(round(py_)))
+                               for px_, py_ in wp)
+    else:
+        pts = [(lx, ly), txy]
+    for (ax_, ay_), (bx_, by_) in zip(pts, pts[1:]):
+        steps = max(1, int(max(abs(bx_ - ax_), abs(by_ - ay_))))
+        for j in range(1, steps + 1):
+            out.append((int(round(ax_ + (bx_ - ax_) * j / steps)),
+                        int(round(ay_ + (by_ - ay_) * j / steps)), ll))
+
+
+def local_ball_pitch(pcb_data, tgt_mm, component_hint: float = 1.5) -> float:
+    """Nearest same-board pad-to-pad distance around a target (mm) -- the
+    ball grid pitch the landing leg threads. 0.0 when nothing is near."""
+    import math as _m
+    best = 0.0
+    cand = []
+    for fp in pcb_data.footprints.values():
+        for p in fp.pads:
+            d = _m.hypot(p.global_x - tgt_mm[0], p.global_y - tgt_mm[1])
+            if d < component_hint:
+                cand.append((d, p))
+    cand.sort(key=lambda t: t[0])
+    if len(cand) >= 2 and cand[0][0] < 0.2:
+        best = _m.hypot(cand[1][1].global_x - cand[0][1].global_x,
+                        cand[1][1].global_y - cand[0][1].global_y)
+    return best
+
+
+def terminal_leader_target(bg: BusGroup, net_id: int,
+                           corridor_path: List[Tuple[int, int, int]],
+                           config, pcb_data
+                           ) -> Optional[List[Tuple[int, int, int]]]:
+    """#622 take-2: the LEADER's terminal refinement -- its corridor
+    truncated at the peel-off point plus the gap-aware landing leg (no
+    lateral offset; the leader owns the centerline). Keeps the leader
+    from corner-cutting into the ball field across its siblings' faces."""
+    if not corridor_path or len(corridor_path) < 4 \
+            or net_id not in bg.net_ids:
+        return None
+    gs = config.grid_step
+    k = bg.net_ids.index(net_id)
+    tgt = bg.target_positions[k]
+    txy = (tgt[0] / gs, tgt[1] / gs)
+    pts = list(corridor_path)
+    d0 = (pts[0][0] - txy[0]) ** 2 + (pts[0][1] - txy[1]) ** 2
+    d1 = (pts[-1][0] - txy[0]) ** 2 + (pts[-1][1] - txy[1]) ** 2
+    if d0 < d1:
+        pts = pts[::-1]
+    peel = min(range(len(pts)),
+               key=lambda i: (pts[i][0] - txy[0]) ** 2
+               + (pts[i][1] - txy[1]) ** 2)
+    # Back the peel off to ~1.5 ball pitches from the target so the leg
+    # (not the corridor tail) owns the final approach.
+    bp = local_ball_pitch(pcb_data, tgt)
+    if bp > 0:
+        back = 1.5 * bp / gs
+        while peel > 3 and ((pts[peel][0] - txy[0]) ** 2
+                            + (pts[peel][1] - txy[1]) ** 2) < back * back:
+            peel -= 1
+    if peel < 3:
+        return None
+    out = list(pts[:peel + 1])
+    _corners: List[Tuple[int, int]] = []
+    _append_landing_leg(out, txy, config, pcb_data, ball_pitch_mm=bp,
+                        corners_out=_corners)
+    return out, _corners
+
+
 def bus_attraction_context(
     net_id: int,
     bus_net_to_group: Optional[Dict[int, BusGroup]],
@@ -417,6 +765,16 @@ def bus_attraction_context(
     bg = (bus_net_to_group or {}).get(net_id)
     if bg is None:
         return None, False
+    # #622 take2 D (KICAD_BUS_FOLLOW_LEADER=1): a routed sibling's REALIZED
+    # path outranks the planned corridor -- the leader follows the plan,
+    # every follower packs against actual copper (the human's pack; the
+    # shared-centerline attraction left members 2-3mm apart because two
+    # tracks cannot both occupy the centerline, measured at K=2).
+    import os as _fl_os
+    if _fl_os.environ.get('KICAD_BUS_FOLLOW_LEADER'):
+        _nb = get_attraction_neighbor(bg, net_id, routed_paths or {})
+        if _nb is not None:
+            return _nb, (bg.clique_endpoint == "target")
     attr = ((bus_corridors or {}).get(bg.name)
             or get_attraction_neighbor(bg, net_id, routed_paths or {}))
     return attr, (bg.clique_endpoint == "target")
