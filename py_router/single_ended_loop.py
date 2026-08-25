@@ -474,6 +474,16 @@ def route_single_ended_nets(
             print(f"  Board bus re-plan: {_n0622} detected group(s) -> "
                   f"{len(bus_groups)} layer-homogeneous chain(s)")
 
+        # #622 macro river plan (user law #3, KICAD_BUS_MACRO_RIVERS=1):
+        # partition groups into directional rivers with ONE layer each,
+        # so cross-river crossings are free by construction. Each river
+        # is a full BusGroup afterwards -- own leader, corridor, berth
+        # solve, physical order.
+        if bus_groups:
+            from bus_detection import split_groups_to_layer_rivers
+            bus_groups = split_groups_to_layer_rivers(
+                pcb_data, bus_groups, config)
+
         if bus_groups:
             print(f"\n=== Bus Detection: Found {len(bus_groups)} bus group(s) ===")
             for bus in bus_groups:
@@ -684,67 +694,18 @@ def route_single_ended_nets(
         _leg_segs_622 = None
         import os as _el_os
         if _el_os.environ.get('KICAD_BUS_EXACT_LEGS'):
-            _bg_el = (bus_net_to_group or {}).get(net_id)
-            if _bg_el is not None and net_id in _bg_el.net_ids:
-                _k_el = _bg_el.net_ids.index(net_id)
-                _tgt_el = _bg_el.target_positions[_k_el]
-                _bare = not any(
-                    s.net_id == net_id
-                    and min(abs(s.start_x - _tgt_el[0])
-                            + abs(s.start_y - _tgt_el[1]),
-                            abs(s.end_x - _tgt_el[0])
-                            + abs(s.end_y - _tgt_el[1])) < 1.0
-                    for s in pcb_data.segments)
-                if _bare:
-                    from bus_terminal import emit_landing_leg
-                    _n_el = float(len(_bg_el.net_ids))
-                    _scx = sum(p[0] for p in _bg_el.source_positions) / _n_el
-                    _scy = sum(p[1] for p in _bg_el.source_positions) / _n_el
-                    # #622 take-2 berth assignment (KICAD_BUS_BERTHS=1):
-                    # solve ALL the group's landing gaps once, at the
-                    # first bare member, on the base board -- emission
-                    # then reads the plan instead of racing siblings for
-                    # gaps (first-come contention measured at K=8: late
-                    # legs fell through to far-side exits and orbited).
-                    _planned_el = None
-                    _has_plan_el = False
-                    if _el_os.environ.get('KICAD_BUS_BERTHS'):
-                        _bplan = getattr(_bg_el, '_berth_plan', None)
-                        if _bplan is None:
-                            from bus_terminal import plan_landing_berths
-                            _bare_ids = []
-                            for _j_el, _m_el in enumerate(_bg_el.net_ids):
-                                _mt_el = _bg_el.target_positions[_j_el]
-                                if not any(
-                                        s.net_id == _m_el
-                                        and min(abs(s.start_x - _mt_el[0])
-                                                + abs(s.start_y - _mt_el[1]),
-                                                abs(s.end_x - _mt_el[0])
-                                                + abs(s.end_y - _mt_el[1]))
-                                        < 1.0
-                                        for s in pcb_data.segments):
-                                    _bare_ids.append(_m_el)
-                            _bplan = plan_landing_berths(
-                                pcb_data, _bg_el, config, _bare_ids)
-                            setattr(_bg_el, '_berth_plan', _bplan)
-                        if net_id in _bplan:
-                            _planned_el = _bplan[net_id]
-                            _has_plan_el = True
-                    if _has_plan_el and _planned_el is None:
-                        _el_res = None  # planned DIVE: emit nothing
-                    else:
-                        _alts_el = None
-                        if _has_plan_el:
-                            _alts_el = (_bplan.get('_alternates') or {}) \
-                                .get(net_id)
-                        _el_res = emit_landing_leg(
-                            pcb_data, net_id, _tgt_el, (_scx, _scy),
-                            config, planned_pts=_planned_el,
-                            alternate_pts=_alts_el)
-                    if _el_res is not None:
-                        _tip_el, _leg_segs_622 = _el_res
-                        _bg_el.target_positions[_k_el] = _tip_el
-                        _leg_tip_622 = (_tip_el, (_tgt_el[0], _tgt_el[1]))
+            # Bareness test, lazy berth-plan solve (KICAD_BUS_BERTHS),
+            # planned-leg/alternate emission and the group-target update
+            # all live in ensure_landing_leg -- SHARED with the reroute
+            # loop so a ripped member re-enters with its leg re-emitted
+            # instead of diving at the bare ball.
+            from bus_terminal import ensure_landing_leg
+            _el_res = ensure_landing_leg(
+                pcb_data, (bus_net_to_group or {}).get(net_id),
+                net_id, config)
+            if _el_res is not None:
+                _tip_el, _leg_segs_622, _ball_el = _el_res
+                _leg_tip_622 = (_tip_el, (_ball_el[0], _ball_el[1]))
         attraction_path, reverse_direction = bus_attraction_context(
             net_id, bus_net_to_group, bus_corridors, bus_routed_paths)
         # #622 take-2 terminal plan: when follow-leader attraction handed
@@ -865,6 +826,17 @@ def route_single_ended_nets(
         # #658 power discipline: power nets get their own layer economics
         # (off the highways, dive-fast) -- see power_layer_config.
         cfg_route = power_layer_config(cfg_route, config, net_id)
+        # #622 macro rivers: a member holds its river's assigned layer.
+        # 5x on other layers, same dose as the corridor probe: at 2x a
+        # ~10mm member pays less to stay off-layer (~100 units) than its
+        # two on-ramp dive vias (~190), so every follower defected
+        # (measured m9_8: leader 0.88 on-layer, followers 0.00-0.27).
+        # User layer fences respected inside the shaper.
+        _bg_riv622 = (bus_net_to_group or {}).get(net_id)
+        if _bg_riv622 is not None:
+            from bus_detection import bus_river_layer_config
+            cfg_route = bus_river_layer_config(cfg_route, config,
+                                               _bg_riv622, mult=5.0)
         # #572: oracle forced links outrank endpoint derivation -- the
         # model's zone credit merges the exact-fill clusters, so both the
         # multipoint and plain derivations "see" no gap and succeed with

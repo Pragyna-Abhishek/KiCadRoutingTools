@@ -168,6 +168,35 @@ def run_reroute_loop(
             _attr, _rev = bus_attraction_context(
                 ripped_net_id, getattr(state, 'bus_net_to_group', None),
                 getattr(state, 'bus_corridors', None), routed_net_paths)
+            # #622 take-2: a ripped bus member re-enters with the FULL
+            # bus stack, not just raw attraction. Its landing leg was
+            # ripped WITH its result (legs ride results for the sync),
+            # so without re-emission every rip demoted the member to a
+            # dive-at-the-ball loose net; the stick and river-layer
+            # economics were likewise main-loop-only (measured: 38-74
+            # rips at K=51 = most of the bus re-routed degraded).
+            _cfg_rr622 = config
+            _leg_segs_rr622 = None
+            _bg_rr622 = (getattr(state, 'bus_net_to_group', None)
+                         or {}).get(ripped_net_id)
+            if _bg_rr622 is not None:
+                from bus_terminal import ensure_landing_leg
+                from bus_detection import bus_river_layer_config
+                _el_rr = ensure_landing_leg(pcb_data, _bg_rr622,
+                                            ripped_net_id, config)
+                if _el_rr is not None:
+                    _leg_segs_rr622 = _el_rr[1]
+                    print(f"  Landing leg re-emitted for ripped member "
+                          f"(tip {_el_rr[0][0]:.2f},{_el_rr[0][1]:.2f})")
+                # Victims re-enter with the leg but the GENTLE economy:
+                # arming stick+5x river costs on rip victims amplified
+                # the cascade (measured n2_51: 74 -> 111 rips, vias 252
+                # -> 277) -- a constrained re-entrant rips others. Same
+                # philosophy as the basin's retry disarm: a locked lane
+                # must never cost completion. River layer stays as a 2x
+                # preference so a victim still leans home.
+                _cfg_rr622 = bus_river_layer_config(
+                    config, config, _bg_rr622, mult=2.0)
             # #572: a ripped forced-link net re-routes its EXACT oracle links
             # -- derived endpoints are model-blind to the exact-fill gap, so
             # a plain reroute here would reconnect arbitrary fragments and
@@ -179,12 +208,13 @@ def run_reroute_loop(
             if _olinks_rr:
                 print(f"  Re-routing {len(_olinks_rr)} exact-fill oracle "
                       f"link(s) (#572 forced edges)")
-                result = route_oracle_links(pcb_data, ripped_net_id, config,
+                result = route_oracle_links(pcb_data, ripped_net_id,
+                                            _cfg_rr622,
                                             obstacles, _olinks_rr,
                                             attraction_path=_attr)
             elif multipoint_pads:
                 print(f"  Multi-point net with {len(multipoint_pads)} pads - routing main + taps")
-                result = route_multipoint_main(pcb_data, ripped_net_id, config, obstacles, multipoint_pads,
+                result = route_multipoint_main(pcb_data, ripped_net_id, _cfg_rr622, obstacles, multipoint_pads,
                                                attraction_path=_attr, state=state)
                 # If Phase 1 succeeded, immediately do Phase 3 (tap routing)
                 if result and not result.get('failed') and result.get('is_multipoint'):
@@ -207,7 +237,7 @@ def run_reroute_loop(
                         if ripped_net_id in state.pending_multipoint_nets:
                             del state.pending_multipoint_nets[ripped_net_id]
             else:
-                result = route_net_with_obstacles(pcb_data, ripped_net_id, config, obstacles,
+                result = route_net_with_obstacles(pcb_data, ripped_net_id, _cfg_rr622, obstacles,
                                                   attraction_path=_attr,
                                                   reverse_direction=_rev)
             elapsed = time.time() - start_time
@@ -222,6 +252,13 @@ def run_reroute_loop(
                 results.append(result)
                 successful += 1
                 total_iterations += result['iterations']
+                # #622: the re-emitted landing leg rides the RESULT (the
+                # sync strips mid-run copper that is neither original nor
+                # in results -- the f4_2 lesson, reroute-loop edition).
+                if _leg_segs_rr622:
+                    result['new_segments'] = (list(result['new_segments'])
+                                              + list(_leg_segs_rr622))
+                    _leg_segs_rr622 = None
                 record_single_ended_success(
                     pcb_data, result, ripped_net_id, config,
                     remaining_net_ids, routed_net_ids, routed_net_paths,
@@ -503,6 +540,12 @@ def run_reroute_loop(
                                 if ripped_net_id in remaining_net_ids:
                                     remaining_net_ids.remove(ripped_net_id)
                                 routed_net_ids.append(ripped_net_id)
+                                # #622: leg rides the retry result too.
+                                if _leg_segs_rr622:
+                                    retry_result['new_segments'] = (
+                                        list(retry_result['new_segments'])
+                                        + list(_leg_segs_rr622))
+                                    _leg_segs_rr622 = None
                                 routed_results[ripped_net_id] = retry_result
                                 record_net_event(state, ripped_net_id, "reroute_succeeded", {
                                     "context": "reroute_loop",
@@ -600,6 +643,21 @@ def run_reroute_loop(
                     # trying to route taps for a net with no main route.
                     if ripped_net_id in state.pending_multipoint_nets:
                         del state.pending_multipoint_nets[ripped_net_id]
+                    # #622: retract the re-emitted landing leg first -- a
+                    # terminal restore re-adds the PRE-RIP result (which
+                    # carries its own leg), and any leftover new leg would
+                    # ship as a duplicate spur beside it.
+                    if _leg_segs_rr622:
+                        from bus_terminal import remove_landing_leg
+                        _n_rm = remove_landing_leg(pcb_data, _leg_segs_rr622)
+                        if _bg_rr622 is not None and _el_rr is not None \
+                                and ripped_net_id in _bg_rr622.net_ids:
+                            _bg_rr622.target_positions[
+                                _bg_rr622.net_ids.index(ripped_net_id)] = \
+                                _el_rr[2]
+                        print(f"  Landing leg retracted: {_n_rm} seg(s) "
+                              f"freed after terminal reroute failure")
+                        _leg_segs_rr622 = None
                     # #468: a terminally-failed rip victim must not ship with
                     # LESS copper than it started with. Conflict-free saved
                     # copper -> FULL restore (the net returns to its pre-rip

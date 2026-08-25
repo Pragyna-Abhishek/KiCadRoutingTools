@@ -125,6 +125,20 @@ def plan_bus_corridors(pcb_data, config, bus_groups: List[BusGroup],
                 via_cost=int(round(config.via_cost * via_mult)),
                 power_net_widths={**config.power_net_widths,
                                   rep: config.track_width + 2 * k * room_mm})
+            # #622 macro rivers: a river group's corridor must be probed
+            # ON its assigned layer -- at the laminar 20x via price the
+            # probe pins to the representative's TOOTH layer and the
+            # whole river then follows a wrong-layer skeleton (measured
+            # m8_8: B river, corridor layers [0]). River groups probe at
+            # the NORMAL via price (on-ramp dives are the human's
+            # dive-river-dive; mid-path wander is suppressed by the 5x
+            # off-river-layer cost instead, and the demotion counter
+            # already forgives ramp changes within 3mm of the ends).
+            if getattr(g, 'river_layer', None):
+                from bus_detection import bus_river_layer_config
+                cfg_k = bus_river_layer_config(
+                    replace(cfg_k, via_cost=config.via_cost),
+                    config, g, mult=5.0)
             result = route_net_with_obstacles(
                 pcb_data, rep, cfg_k, probe_map,
                 reverse_direction=(g.clique_endpoint == "target"))

@@ -462,6 +462,60 @@ def plan_landing_berths(pcb_data: PCBData, group, config,
     return plan
 
 
+def ensure_landing_leg(pcb_data: PCBData, group, net_id: int, config):
+    """One-stop landing-leg emission for a bus member: bareness test,
+    lazy berth-plan solve (cached on the group), planned-leg/alternate
+    emission, and the group-target update to the new tip. Returns
+    (tip, [Segment...], ball_xy) or None (not armed, not bare, planned
+    DIVE, or blocked). SHARED by the main loop and the reroute loop --
+    a ripped member's leg is ripped with its result, and re-entering
+    without re-emission meant every rip demoted the member to a
+    dive-at-the-ball loose net."""
+    import os as _os
+    if not _os.environ.get('KICAD_BUS_EXACT_LEGS'):
+        return None
+    if group is None or net_id not in group.net_ids:
+        return None
+    k = group.net_ids.index(net_id)
+    tgt = group.target_positions[k]
+
+    def _bare(nid, t):
+        return not any(
+            s.net_id == nid
+            and min(abs(s.start_x - t[0]) + abs(s.start_y - t[1]),
+                    abs(s.end_x - t[0]) + abs(s.end_y - t[1])) < 1.0
+            for s in pcb_data.segments)
+
+    if not _bare(net_id, tgt):
+        return None
+    _n = float(len(group.net_ids))
+    appr = (sum(p[0] for p in group.source_positions) / _n,
+            sum(p[1] for p in group.source_positions) / _n)
+    planned = None
+    has_plan = False
+    alts = None
+    if _os.environ.get('KICAD_BUS_BERTHS'):
+        plan = getattr(group, '_berth_plan', None)
+        if plan is None:
+            bare_ids = [m for j, m in enumerate(group.net_ids)
+                        if _bare(m, group.target_positions[j])]
+            plan = plan_landing_berths(pcb_data, group, config, bare_ids)
+            setattr(group, '_berth_plan', plan)
+        if net_id in plan:
+            planned = plan[net_id]
+            has_plan = True
+            alts = (plan.get('_alternates') or {}).get(net_id)
+    if has_plan and planned is None:
+        return None                      # planned DIVE: emit nothing
+    res = emit_landing_leg(pcb_data, net_id, tgt, appr, config,
+                           planned_pts=planned, alternate_pts=alts)
+    if res is None:
+        return None
+    tip, segs = res
+    group.target_positions[k] = tip
+    return tip, segs, tgt
+
+
 def emit_landing_leg(pcb_data: PCBData, net_id: int,
                      ball_xy: Tuple[float, float],
                      approach_from: Tuple[float, float],

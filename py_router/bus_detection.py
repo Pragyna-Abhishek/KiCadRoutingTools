@@ -794,3 +794,196 @@ def bus_attraction_context(
     attr = ((bus_corridors or {}).get(bg.name)
             or get_attraction_neighbor(bg, net_id, routed_paths or {}))
     return attr, (bg.clique_endpoint == "target")
+
+
+def _principal_scalar(points):
+    """Project points onto their principal axis; returns the scalar list
+    (length-weighted PCA is overkill for endpoint clouds -- plain
+    covariance eigenvector)."""
+    import math as _m
+    n = float(len(points))
+    mx = sum(p[0] for p in points) / n
+    my = sum(p[1] for p in points) / n
+    sxx = sum((p[0] - mx) ** 2 for p in points)
+    syy = sum((p[1] - my) ** 2 for p in points)
+    sxy = sum((p[0] - mx) * (p[1] - my) for p in points)
+    tr, det = sxx + syy, sxx * syy - sxy * sxy
+    lam = tr / 2 + _m.sqrt(max(0.0, tr * tr / 4 - det))
+    ax = (lam - syy, sxy) if abs(sxy) > 1e-9 else \
+        ((1.0, 0.0) if sxx >= syy else (0.0, 1.0))
+    L = _m.hypot(*ax) or 1.0
+    ux, uy = ax[0] / L, ax[1] / L
+    return [(p[0] - mx) * ux + (p[1] - my) * uy for p in points]
+
+
+def split_groups_to_layer_rivers(pcb_data, bus_groups, config):
+    """#622 macro river plan (user law #3, KICAD_BUS_MACRO_RIVERS=1):
+    partition each bus group into DIRECTIONAL RIVERS and give each river
+    ONE layer, so crossings between rivers become FREE (a layer split
+    pays nothing) and only within-river twist remains paid.
+
+    Measured basis (disorder.py vs the human original): at K=30 the
+    human CROSSES MORE than we do (206 vs 106) but pays for less (73 vs
+    57 same-layer, 26 vs 73 mid-run vias) -- its F/B directional rivers
+    make crossings free. Our single-layer groups pay every inversion
+    mid-flight.
+
+    Mechanism: crossing graph = member pairs whose comb order inverts
+    against their landing order (axis-aligned by majority so a global
+    flip is not 100% crossings); 2-color it MAX-CUT-style by local
+    search, cost = monochromatic crossing edges + teeth-layer mismatches
+    (a mismatched tooth = the human's 2-via dive, same price as a paid
+    crossing). Split only when the 2-river cost beats the whole-group
+    cost; each side keeps >= 2 members. Parallel lists are sliced
+    TOGETHER (the position-sync lesson). Each river carries river_layer
+    for bus_river_layer_config."""
+    import os as _os
+    if not _os.environ.get('KICAD_BUS_MACRO_RIVERS'):
+        return bus_groups
+    out = []
+    for bus in bus_groups:
+        n = len(bus.net_ids)
+        if n < 4:
+            out.append(bus)
+            continue
+        if bus.clique_endpoint == "target":
+            combs, lands = bus.target_positions, bus.source_positions
+        else:
+            combs, lands = bus.source_positions, bus.target_positions
+        comb_s = _principal_scalar(combs)
+        land_s = _principal_scalar(lands)
+        # align landing axis to comb order by pair majority
+        agree = sum(1 for i in range(n) for j in range(i + 1, n)
+                    if (comb_s[i] - comb_s[j]) * (land_s[i] - land_s[j]) > 0)
+        total_pairs = n * (n - 1) // 2
+        if agree * 2 < total_pairs:
+            land_s = [-v for v in land_s]
+        cross = [[False] * n for _ in range(n)]
+        n_cross = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                if (comb_s[i] - comb_s[j]) * (land_s[i] - land_s[j]) < 0:
+                    cross[i][j] = cross[j][i] = True
+                    n_cross += 1
+        teeth = [net_teeth_common_layer(pcb_data, nid)
+                 for nid in bus.net_ids]
+        from collections import Counter as _C
+        layer_votes = _C(t for t in teeth if t)
+        # A pour-covered layer cannot host a river: the plane-fragility
+        # field overpowers any polite layer nudge and every member
+        # defects (measured m2_51: 12/12 B-river members below 50%
+        # on-layer, board WORSE than unsplit -- the human's F/B split is
+        # cheap only because their board has no pour). Exclude pour
+        # layers; when fewer than two free layers remain (2-layer +
+        # pour), the group stays whole, disclosed.
+        pour_layers = set()
+        if not _os.environ.get('KICAD_BUS_RIVER_POUR_OK'):
+            # KICAD_BUS_RIVER_POUR_OK=1: deliberate override -- the user
+            # accepts a river across the pour (or a probe arm simulates
+            # a pour-free board with KICAD_PLANE_FRAGILITY_COST=0).
+            for z in (getattr(pcb_data, 'zones', None) or []):
+                if getattr(z, 'layer', None):
+                    pour_layers.add(z.layer)
+                for zl in (getattr(z, 'layers', None) or []):
+                    pour_layers.add(zl)
+        cands = [l for l, _ in layer_votes.most_common()
+                 if l not in pour_layers][:2]
+        copper = list(getattr(config, 'layers', None) or [])
+        for l in copper:
+            if len(cands) >= 2:
+                break
+            if l not in cands and l not in pour_layers:
+                cands.append(l)
+        if len(cands) < 2:
+            out.append(bus)
+            print(f"  Macro rivers: {bus.name} kept whole -- fewer than "
+                  f"two pour-free layers "
+                  f"(pour on {sorted(pour_layers) or 'none'})")
+            continue
+
+        def cost(side):
+            mono = sum(1 for i in range(n) for j in range(i + 1, n)
+                       if cross[i][j] and side[i] == side[j])
+            best = None
+            for la, lb in ((cands[0], cands[1]), (cands[1], cands[0])):
+                mism = sum(1 for i in range(n)
+                           if teeth[i] is not None
+                           and teeth[i] != (la if side[i] == 0 else lb))
+                if best is None or mism < best[0]:
+                    best = (mism, la, lb)
+            return mono + best[0], best[1], best[2]
+
+        # whole-group baseline: everyone one river on the majority layer
+        base_mism = min(
+            sum(1 for t in teeth if t is not None and t != l)
+            for l in cands)
+        base_cost = n_cross + base_mism
+        # init: landing-median split (the natural directional partition)
+        med = sorted(land_s)[n // 2]
+        side = [0 if v < med else 1 for v in land_s]
+        cur, la, lb = cost(side)
+        improved = True
+        while improved:
+            improved = False
+            for i in range(n):
+                side[i] ^= 1
+                c2, la2, lb2 = cost(side)
+                if c2 < cur and min(side.count(0), side.count(1)) >= 2:
+                    cur, la, lb = c2, la2, lb2
+                    improved = True
+                else:
+                    side[i] ^= 1
+        if cur >= base_cost or min(side.count(0), side.count(1)) < 2:
+            out.append(bus)
+            print(f"  Macro rivers: {bus.name} kept whole "
+                  f"(split cost {cur} >= whole {base_cost})")
+            continue
+        for s_val, layer, tag in ((0, la, 'a'), (1, lb, 'b')):
+            keep_idx = [i for i in range(n) if side[i] == s_val]
+            sub = BusGroup(
+                name=f"{bus.name}_r{tag}",
+                net_ids=[bus.net_ids[i] for i in keep_idx],
+                source_positions=[bus.source_positions[i]
+                                  for i in keep_idx],
+                target_positions=[bus.target_positions[i]
+                                  for i in keep_idx],
+                clique_endpoint=bus.clique_endpoint)
+            sub.river_layer = layer
+            out.append(sub)
+            nm = [pcb_data.nets[nid].name.split('/')[-1]
+                  for nid in sub.net_ids]
+            print(f"  Macro rivers: {sub.name} -> {layer} "
+                  f"({len(nm)}: {' '.join(nm)})")
+        print(f"  Macro rivers: {bus.name} split cost {cur} vs whole "
+              f"{base_cost} (crossing pairs {n_cross})")
+    return out
+
+
+def bus_river_layer_config(cfg_route, config, group, mult=2.0):
+    """Per-member layer economics for a macro river (river_layer on the
+    group): the assigned layer keeps the group's cheapest cost, every
+    other copper layer pays `mult`x -- enough to hold the river on its
+    layer, mild enough that terminal surfacing (the landing leg is
+    surface copper) and genuine detours stay affordable. The corridor
+    probe passes a stiffer mult (its laminar 20x via price otherwise
+    pins the probe to the TOOTH's layer and the whole river follows it
+    off-plan -- measured m8_8: the B river's corridor probed layers
+    [0]). Guarded like the take-1 lane-layer lesson: an explicit user
+    layer fence (any cost > 3x the min) is never overridden."""
+    layer = getattr(group, 'river_layer', None)
+    if not layer:
+        return cfg_route
+    layers = list(getattr(cfg_route, 'layers', None) or [])
+    if layer not in layers:
+        return cfg_route
+    base = list(cfg_route.layer_costs or []) or [1.0] * len(layers)
+    while len(base) < len(layers):
+        base.append(1.0)
+    pos = [c for c in base if c >= 0]
+    if pos and max(pos) > 3.0 * min(pos):
+        return cfg_route                 # user fence -- hands off
+    lo = min(pos) if pos else 1.0
+    shaped = [c if c < 0 else (lo if layers[i] == layer else c * mult)
+              for i, c in enumerate(base)]
+    from dataclasses import replace as _rep
+    return _rep(cfg_route, layer_costs=shaped)
