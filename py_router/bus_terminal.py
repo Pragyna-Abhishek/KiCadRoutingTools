@@ -22,7 +22,7 @@ pcb_data._emitted_legs for the output writer.
 """
 
 import math
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from kicad_parser import PCBData, Segment
 
@@ -33,6 +33,25 @@ def _pt_seg_d(px, py, x1, y1, x2, y2):
     t = 0.0 if L2 <= 0 else max(0.0, min(1.0, ((px - x1) * dx
                                                + (py - y1) * dy) / L2))
     return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+
+
+def _seg_seg_d(x1, y1, x2, y2, u1, v1, u2, v2):
+    """Segment-segment distance, 0 when they properly intersect.
+    Endpoint distances alone are BLIND to a crossing (two legs crossed
+    mid-span with every endpoint 0.5mm clear -- shipped an F.Cu short,
+    h1_8 SA10xSDQ5)."""
+    d1x, d1y = x2 - x1, y2 - y1
+    d2x, d2y = u2 - u1, v2 - v1
+    denom = d1x * d2y - d1y * d2x
+    if abs(denom) > 1e-12:
+        t = ((u1 - x1) * d2y - (v1 - y1) * d2x) / denom
+        s = ((u1 - x1) * d1y - (v1 - y1) * d1x) / denom
+        if 0.0 <= t <= 1.0 and 0.0 <= s <= 1.0:
+            return 0.0
+    return min(_pt_seg_d(u1, v1, x1, y1, x2, y2),
+               _pt_seg_d(u2, v2, x1, y1, x2, y2),
+               _pt_seg_d(x1, y1, u1, v1, u2, v2),
+               _pt_seg_d(x2, y2, u1, v1, u2, v2))
 
 
 def _leg_clear(pcb_data: PCBData, pts: List[Tuple[float, float]],
@@ -64,16 +83,9 @@ def _leg_clear(pcb_data: PCBData, pts: List[Tuple[float, float]],
         for s in pcb_data.segments:
             if s.net_id == net_id or s.layer != layer:
                 continue
-            if (_pt_seg_d(s.start_x, s.start_y, x1, y1, x2, y2)
-                    < s.width / 2.0 + hw + clearance - 1e-6
-                    or _pt_seg_d(s.end_x, s.end_y, x1, y1, x2, y2)
-                    < s.width / 2.0 + hw + clearance - 1e-6
-                    or _pt_seg_d(x1, y1, s.start_x, s.start_y,
-                                 s.end_x, s.end_y)
-                    < s.width / 2.0 + hw + clearance - 1e-6
-                    or _pt_seg_d(x2, y2, s.start_x, s.start_y,
-                                 s.end_x, s.end_y)
-                    < s.width / 2.0 + hw + clearance - 1e-6):
+            if _seg_seg_d(x1, y1, x2, y2, s.start_x, s.start_y,
+                          s.end_x, s.end_y) \
+                    < s.width / 2.0 + hw + clearance - 1e-6:
                 return False
         for v in pcb_data.vias:
             if v.net_id == net_id:
@@ -101,22 +113,11 @@ def remove_landing_leg(pcb_data: PCBData, leg_segs: List[Segment]) -> int:
     return len(ids)
 
 
-def emit_landing_leg(pcb_data: PCBData, net_id: int,
-                     ball_xy: Tuple[float, float],
-                     approach_from: Tuple[float, float],
-                     config) -> Optional[Tuple[float, float]]:
-    """Emit an exact-checked landing leg for `net_id`'s bare ball; returns
-    (tip, [Segment, ...]) or None (no emission --
-    ball not in a field, no gap, or the leg fails its exact check).
-
-    Geometry (the fanout dog-bone jog, destination-side): 45-degree jog
-    from the ball into the nearer inter-column gap (half a ball pitch to
-    the side of the approach), straight along the exit axis past the
-    field's outer row, tip half a pitch beyond the fringe."""
+def _ball_context(pcb_data: PCBData, ball_xy: Tuple[float, float]):
+    """Owning footprint + local pitch + field pads for a bare ball, or
+    None when the ball is not in a modelable field. Extracted from
+    emit_landing_leg (the 3mm-neighborhood/whole-footprint lesson, f1_2)."""
     bx, by = ball_xy
-    # local ball pitch from the nearest neighbors, field extent from the
-    # WHOLE owning footprint (a 3mm neighborhood capped the extent walk and
-    # planted the tip INSIDE the field -- measured, f1_2).
     near = []
     owner = None
     for fp in pcb_data.footprints.values():
@@ -133,64 +134,332 @@ def emit_landing_leg(pcb_data: PCBData, net_id: int,
                        near[1][1].global_y - near[0][1].global_y)
     if pitch < 0.3:
         return None
-    field = [p for p in owner.pads]
+    return owner, pitch, list(owner.pads)
+
+
+def _leg_candidates(ctx, ball_xy: Tuple[float, float],
+                    approach_from: Tuple[float, float],
+                    lane_shifts: int = 1, lane_pitch: float = 0.4):
+    """Candidate landing legs for one ball, sorted approach-compatible
+    first then shortest run: (compat_rank, run, pts, tip) tuples, NOT yet
+    exact-checked. lane_shifts>1 adds lane-shifted variants of each gap
+    line (k*lane_pitch further out) -- capacity in the wide inter-block
+    channels for the berth planner; the jog stretches to stay 45-degree."""
+    owner, pitch, field = ctx
+    bx, by = ball_xy
     ax, ay = approach_from[0] - bx, approach_from[1] - by
 
-    def _leg_for(side, lsgn):
-        """Candidate leg for one (exit side, gap lateral sign); returns
-        (run_length, pts, tip) or None."""
+    def _leg_for(side, lsgn, shift):
         exit_x_axis = side in ('e', 'w')
         sgn = 1.0 if side in ('e', 's') else -1.0
+        off = pitch / 2.0 + shift * lane_pitch
         if exit_x_axis:
-            gap_line = by + lsgn * pitch / 2.0
+            gap_line = by + lsgn * off
         else:
-            gap_line = bx + lsgn * pitch / 2.0
+            gap_line = bx + lsgn * off
+        # The tip must clear the WHOLE field on the exit axis, not just
+        # the lane's own blocking pads: an empty lane (the wide
+        # inter-block channel) used to stop the walk at the ball and
+        # plant the tip INSIDE the field -- the trunk then traveled the
+        # channel to reach it, squatting siblings' planned lanes
+        # (measured g3_8: 4 of 8 berth legs blocked at emission).
         extent = bx if exit_x_axis else by
         for p in field:
             u = p.global_x if exit_x_axis else p.global_y
-            w = p.global_y if exit_x_axis else p.global_x
-            if abs(w - gap_line) < pitch * 0.75 and (u - extent) * sgn > 0:
+            if (u - extent) * sgn > 0:
                 extent = u
         tip_u = extent + sgn * (pitch / 2.0 + 0.2)
         if exit_x_axis:
-            jog = (bx + sgn * pitch / 2.0, gap_line)
+            jog = (bx + sgn * off, gap_line)
             tip = (tip_u, gap_line)
         else:
-            jog = (gap_line, by + sgn * pitch / 2.0)
+            jog = (gap_line, by + sgn * off)
             tip = (gap_line, tip_u)
         run = abs(tip_u - (bx if exit_x_axis else by))
         return run, [(bx, by), jog, tip], tip
 
-    # Side order: APPROACH-COMPATIBLE first (the tip must face the arriving
-    # pack -- nearest-boundary alone sent legs out the far side and the
-    # route had to wrap the band, 1 failed, measured f2_2), then shortest
-    # run. Per side, the gap lateral toward the approach first.
+    # Side order: PACK-FACING first (the tip must face the arriving pack
+    # -- nearest-boundary alone sent legs out the far side and the route
+    # had to wrap the band, 1 failed, measured f2_2), then perpendicular,
+    # then away-facing; shortest run within a rank. Per side, the gap
+    # lateral toward the approach first. NOTE the sign convention paid
+    # for twice: svec is the EXIT direction and (ax,ay) points from the
+    # ball TO the pack, so exit.dot(approach) > 0 is the GOOD side (the
+    # original code's `compat` flag named it backwards and relied on the
+    # ascending sort; a faithful-looking refactor of it inverted every
+    # side order -- measured g4_8, all-east/north berths).
     _svec = {'e': (1.0, 0.0), 'w': (-1.0, 0.0),
              's': (0.0, 1.0), 'n': (0.0, -1.0)}
+    _al = math.hypot(ax, ay) or 1.0
     cands = []
     for side in ('e', 'w', 's', 'n'):
         if side in ('e', 'w'):
             pref = 1.0 if ay >= 0 else -1.0
         else:
             pref = 1.0 if ax >= 0 else -1.0
-        compat = (_svec[side][0] * ax + _svec[side][1] * ay) <= 0
+        dot_u = (_svec[side][0] * ax + _svec[side][1] * ay) / _al
+        rank = 0 if dot_u > 0.3 else (1 if dot_u > -0.5 else 2)
         for lsgn in (pref, -pref):
-            c = _leg_for(side, lsgn)
-            if c is not None:
-                cands.append((compat,) + c)
+            for shift in range(lane_shifts):
+                c = _leg_for(side, lsgn, shift)
+                if c is not None:
+                    cands.append((rank,) + c)
     cands.sort(key=lambda t: (t[0], t[1]))
-    cands = [c[1:] for c in cands]
-    for _run, pts_c, tip in cands:
-        pts = [p for i, p in enumerate(pts_c)
-               if i == 0 or math.hypot(p[0] - pts_c[i - 1][0],
-                                       p[1] - pts_c[i - 1][1]) > 1e-6]
-        if len(pts) < 2:
+    return cands
+
+
+def _polyline_min_dist(a: List[Tuple[float, float]],
+                       b: List[Tuple[float, float]]) -> float:
+    """Min distance between two polylines, 0 when any pair of their
+    segments crosses (see _seg_seg_d)."""
+    best = float('inf')
+    for (x1, y1), (x2, y2) in zip(a, a[1:]):
+        for (u1, v1), (u2, v2) in zip(b, b[1:]):
+            best = min(best, _seg_seg_d(x1, y1, x2, y2, u1, v1, u2, v2))
+            if best <= 0.0:
+                return 0.0
+    return best
+
+
+def plan_landing_berths(pcb_data: PCBData, group, config,
+                        bare_net_ids: List[int]) -> Dict[int, Optional[list]]:
+    """#622 take-2 berth assignment (user design, item 2): plan every
+    bare-ball member's landing gap UP FRONT with a non-blocking solve, so
+    gap blocking is impossible by construction. First-come emission
+    measured at K=8: early members took the near-side gaps, later legs
+    failed their exact checks and fell through to far-side exits (tips
+    past the field at x=146.5) forcing full-field orbits (ratio 3.7,
+    20 vias/8 nets).
+
+    Candidates per member: approach-compatible short legs (near-edge rule
+    for perpendicular exits: only toward the member's OWN block fringe),
+    lane-shifted channel variants for capacity, exact-checked against the
+    BASE board (no first-come bias). Solve: maximize members berthed,
+    then minimize total run (DFS for small groups, greedy above 12).
+    A member with no conflict-free berth gets None = NO leg: an organized
+    dive beats a pathological surface exit (the human's own overflow
+    policy -- 29 dives, median 0.79mm from the ball)."""
+    n_ids = list(bare_net_ids)
+    per_net = {}
+    fld_pts = []
+    for nid in n_ids:
+        k = group.net_ids.index(nid)
+        ball = group.target_positions[k]
+        ctx = _ball_context(pcb_data, ball)
+        if ctx is None:
+            per_net[nid] = []
             continue
-        if _leg_clear(pcb_data, pts, config.layers[0], config.track_width,
-                      config.clearance, net_id):
-            break
+        _n = float(len(group.net_ids))
+        appr = (sum(p[0] for p in group.source_positions) / _n,
+                sum(p[1] for p in group.source_positions) / _n)
+        _, pitch, field = ctx
+        if not fld_pts:
+            fld_pts = [(p.global_x, p.global_y) for p in field]
+        bx, by = ball
+        # near-edge rule for perpendicular exits: the ball's own block
+        # fringe only (a south exit from a north-block ball crosses the
+        # whole field -- measured K=8, SDQ0 tip 6.2mm through).
+        f_ys = sorted(p.global_y for p in field)
+        _al = math.hypot(appr[0] - bx, appr[1] - by) or 1.0
+        _au = ((appr[0] - bx) / _al, (appr[1] - by) / _al)
+        cands = []
+        for side_rank, run, pts, tip in _leg_candidates(
+                ctx, ball, appr, lane_shifts=3):
+            if side_rank >= 2:
+                continue  # never berth out the far side
+            ex, ey = pts[-1][0] - pts[-2][0], pts[-1][1] - pts[-2][1]
+            _el2 = math.hypot(ex, ey) or 1.0
+            # exits ON the approach axis outrank perpendicular ones:
+            # run-length alone chose 1.4mm north pokes over the 4.6mm
+            # west-fringe legs the accepted K=4 used (measured g3_8) --
+            # the pack arrives on the axis, and a perpendicular tip
+            # makes it wrap a corner.
+            align = -(ex * _au[0] + ey * _au[1]) / _el2  # 0 best
+            if abs(ex) < 1e-6:
+                # n/s exit (vertical last segment): the ball's OWN block
+                # fringe only -- a cross-field exit is a wrap by
+                # construction. e/w exits need no such rule: compat
+                # already pins them to the approach side.
+                mid_y = (f_ys[0] + f_ys[-1]) / 2.0
+                if (by <= mid_y) != (tip[1] <= mid_y):
+                    continue
+            if not _leg_clear(pcb_data, pts, config.layers[0],
+                              config.track_width, config.clearance, nid):
+                continue
+            # solve cost: run in mm plus an axis penalty -- perpendicular
+            # exits pay +4mm-equiv, so they win only when the axis side
+            # is genuinely unavailable, count still dominating both.
+            cost = run + (1.0 + align) * 4.0
+            cands.append((cost, pts, tip))
+        cands.sort(key=lambda c: c[0])
+        per_net[nid] = cands
+
+    # plan-time conflict floor carries +0.1 headroom over the DRC
+    # minimum: lanes planned at the exact floor left no room for
+    # the trunk's attach wiggle at the fringe mouth (SDQ5 blocked
+    # at emission by its neighbor's arrival, g5_8).
+    min_gap = config.track_width + config.clearance + 0.05
+
+    def _conflict(pa, pb):
+        return _polyline_min_dist(pa, pb) < min_gap - 1e-6
+
+    # Tip ORDER term: an inversion between the berth order along the
+    # field perimeter and the group's PHYSICAL order is a crossing the
+    # pack must pay somewhere (2 vias) -- measured g6_8: 8 inversions,
+    # 16 vias, exactly 2 per inversion. Perimeter coordinate s walks
+    # north fringe -> approach-side fringe -> south fringe, so lanes
+    # wrapping a corner still order correctly against the west lanes.
+    # Fringe classification must be against the FIELD hull, not the
+    # group's own ball bbox: a west tip whose gap line rides above the
+    # group's topmost ball is still a WEST tip (measured g8_8 -- it was
+    # scored as a wrapped north lane, inverting every order decision
+    # around it). fld_* comes from the owner footprint's pads.
+    fx_min = min((x for x, y in fld_pts), default=0.0)
+    fy_min = min((y for x, y in fld_pts), default=0.0)
+    fy_max = max((y for x, y in fld_pts), default=0.0)
+
+    def _perim_s(tip):
+        tx, ty = tip
+        if tx < fx_min - 0.05:        # west fringe: order by y
+            return ty
+        if ty < fy_min - 0.05:        # north fringe: deeper east = more north
+            return fy_min - (tx - fx_min)
+        if ty > fy_max + 0.05:        # south fringe: deeper east = more south
+            return fy_max + (tx - fx_min)
+        return ty
+    INV_COST = 4.0  # mm-equiv per crossing (2 vias + detour)
+
+    # DFS in the group's PHYSICAL order so the inversion count against
+    # already-placed members accumulates monotonically (prunable).
+    # Pairwise conflicts and perimeter coords are precomputed -- the
+    # inner loop touches no geometry.
+    order = [nid for nid in group.net_ids if nid in per_net]
+    flat = []                 # (nid, run, pts, tip, s), global index
+    slots = {}                # nid -> [global candidate indices]
+    for nid in order:
+        slots[nid] = []
+        for run, pts, tip in per_net[nid]:
+            slots[nid].append(len(flat))
+            flat.append((nid, run, pts, tip, _perim_s(tip)))
+    n_c = len(flat)
+    conf = [set() for _ in range(n_c)]
+    for a in range(n_c):
+        for b in range(a + 1, n_c):
+            if flat[a][0] != flat[b][0] and \
+                    _conflict(flat[a][2], flat[b][2]):
+                conf[a].add(b)
+                conf[b].add(a)
+    best = {'count': -1, 'cost': float('inf'), 'picks': {}}
+
+    def _dfs(i, picks, taken, cost, placed):
+        if i == len(order):
+            if (placed, -cost) > (best['count'], -best['cost']):
+                best.update(count=placed, cost=cost, picks=dict(picks))
+            return
+        rem = len(order) - i
+        if placed + rem < best['count'] or \
+                (placed + rem == best['count'] and cost >= best['cost']):
+            return
+        nid = order[i]
+        for ci in slots[nid]:
+            if taken & conf[ci]:
+                continue
+            s = flat[ci][4]
+            inv = sum(1 for pj in picks.values()
+                      if pj is not None and flat[pj][4] > s)
+            picks[nid] = ci
+            taken.add(ci)
+            _dfs(i + 1, picks, taken, cost + flat[ci][1] + INV_COST * inv,
+                 placed + 1)
+            taken.discard(ci)
+            del picks[nid]
+        picks[nid] = None
+        _dfs(i + 1, picks, taken, cost, placed)
+        del picks[nid]
+
+    import os as _dbg_os
+    if _dbg_os.environ.get('KICAD_DBG_BERTHS'):
+        for nid in order:
+            nm = pcb_data.nets[nid].name.split('/')[-1]
+            print(f"    [berth-dbg] {nm}: " + " | ".join(
+                f"({flat[ci][3][0]:.2f},{flat[ci][3][1]:.2f})"
+                f" c={flat[ci][1]:.2f} s={flat[ci][4]:.2f}"
+                for ci in slots[nid]))
+    if len(order) <= 12:
+        _dfs(0, {}, set(), 0.0, 0)
+        chosen = {nid: (None if ci is None
+                        else (flat[ci][2], flat[ci][3]))
+                  for nid, ci in best['picks'].items()}
+        if _dbg_os.environ.get('KICAD_DBG_BERTHS'):
+            print(f"    [berth-dbg] best count={best['count']} "
+                  f"cost={best['cost']:.2f}")
     else:
+        chosen = {}
+        for nid in sorted(order, key=lambda nid: len(per_net[nid])):
+            pick = None
+            for run, pts, tip in per_net[nid]:
+                if not any(v is not None and _conflict(pts, v[0])
+                           for v in chosen.values()):
+                    pick = (pts, tip)
+                    break
+            chosen[nid] = pick
+    plan = {}
+    for nid in n_ids:
+        v = chosen.get(nid)
+        plan[nid] = list(v[0]) if v is not None else None
+        nm = pcb_data.nets[nid].name if nid in pcb_data.nets else str(nid)
+        if v is None:
+            print(f"  Berth plan: {nm} -> DIVE (no conflict-free berth)")
+        else:
+            print(f"  Berth plan: {nm} -> tip ({v[1][0]:.2f},{v[1][1]:.2f})")
+    return plan
+
+
+def emit_landing_leg(pcb_data: PCBData, net_id: int,
+                     ball_xy: Tuple[float, float],
+                     approach_from: Tuple[float, float],
+                     config,
+                     planned_pts: Optional[list] = None
+                     ) -> Optional[Tuple[float, float]]:
+    """Emit an exact-checked landing leg for `net_id`'s bare ball; returns
+    (tip, [Segment, ...]) or None (no emission --
+    ball not in a field, no gap, or the leg fails its exact check).
+
+    Geometry (the fanout dog-bone jog, destination-side): 45-degree jog
+    from the ball into the nearer inter-column gap (half a ball pitch to
+    the side of the approach), straight along the exit axis past the
+    field's outer row, tip half a pitch beyond the fringe.
+
+    planned_pts (berth assignment): the pre-solved leg polyline is
+    AUTHORITATIVE -- re-verified against the current board and emitted,
+    but never replaced by a greedy pick (a fallback would resurrect the
+    first-come contention the plan exists to remove)."""
+    ctx = _ball_context(pcb_data, ball_xy)
+    if ctx is None:
         return None
+    pitch = ctx[1]
+    bx, by = ball_xy
+    if planned_pts is not None:
+        pts = list(planned_pts)
+        tip = pts[-1]
+        if not _leg_clear(pcb_data, pts, config.layers[0],
+                          config.track_width, config.clearance, net_id):
+            print(f"  Berth leg BLOCKED at emission: net {net_id} "
+                  f"tip ({tip[0]:.2f},{tip[1]:.2f}) -- no leg (dive)")
+            return None
+    else:
+        cands = _leg_candidates(ctx, ball_xy, approach_from)
+        for _compat, _run, pts_c, tip in cands:
+            pts = [p for i, p in enumerate(pts_c)
+                   if i == 0 or math.hypot(p[0] - pts_c[i - 1][0],
+                                           p[1] - pts_c[i - 1][1]) > 1e-6]
+            if len(pts) < 2:
+                continue
+            if _leg_clear(pcb_data, pts, config.layers[0],
+                          config.track_width, config.clearance, net_id):
+                break
+        else:
+            return None
     layer = config.layers[0]
     width = config.track_width
     legs = getattr(pcb_data, '_emitted_legs', None)

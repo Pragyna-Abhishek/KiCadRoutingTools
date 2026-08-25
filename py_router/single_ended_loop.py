@@ -700,8 +700,42 @@ def route_single_ended_nets(
                     _n_el = float(len(_bg_el.net_ids))
                     _scx = sum(p[0] for p in _bg_el.source_positions) / _n_el
                     _scy = sum(p[1] for p in _bg_el.source_positions) / _n_el
-                    _el_res = emit_landing_leg(
-                        pcb_data, net_id, _tgt_el, (_scx, _scy), config)
+                    # #622 take-2 berth assignment (KICAD_BUS_BERTHS=1):
+                    # solve ALL the group's landing gaps once, at the
+                    # first bare member, on the base board -- emission
+                    # then reads the plan instead of racing siblings for
+                    # gaps (first-come contention measured at K=8: late
+                    # legs fell through to far-side exits and orbited).
+                    _planned_el = None
+                    _has_plan_el = False
+                    if _el_os.environ.get('KICAD_BUS_BERTHS'):
+                        _bplan = getattr(_bg_el, '_berth_plan', None)
+                        if _bplan is None:
+                            from bus_terminal import plan_landing_berths
+                            _bare_ids = []
+                            for _j_el, _m_el in enumerate(_bg_el.net_ids):
+                                _mt_el = _bg_el.target_positions[_j_el]
+                                if not any(
+                                        s.net_id == _m_el
+                                        and min(abs(s.start_x - _mt_el[0])
+                                                + abs(s.start_y - _mt_el[1]),
+                                                abs(s.end_x - _mt_el[0])
+                                                + abs(s.end_y - _mt_el[1]))
+                                        < 1.0
+                                        for s in pcb_data.segments):
+                                    _bare_ids.append(_m_el)
+                            _bplan = plan_landing_berths(
+                                pcb_data, _bg_el, config, _bare_ids)
+                            setattr(_bg_el, '_berth_plan', _bplan)
+                        if net_id in _bplan:
+                            _planned_el = _bplan[net_id]
+                            _has_plan_el = True
+                    if _has_plan_el and _planned_el is None:
+                        _el_res = None  # planned DIVE: emit nothing
+                    else:
+                        _el_res = emit_landing_leg(
+                            pcb_data, net_id, _tgt_el, (_scx, _scy),
+                            config, planned_pts=_planned_el)
                     if _el_res is not None:
                         _tip_el, _leg_segs_622 = _el_res
                         _bg_el.target_positions[_k_el] = _tip_el
