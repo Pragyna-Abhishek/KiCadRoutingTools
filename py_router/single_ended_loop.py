@@ -733,9 +733,14 @@ def route_single_ended_nets(
                     if _has_plan_el and _planned_el is None:
                         _el_res = None  # planned DIVE: emit nothing
                     else:
+                        _alts_el = None
+                        if _has_plan_el:
+                            _alts_el = (_bplan.get('_alternates') or {}) \
+                                .get(net_id)
                         _el_res = emit_landing_leg(
                             pcb_data, net_id, _tgt_el, (_scx, _scy),
-                            config, planned_pts=_planned_el)
+                            config, planned_pts=_planned_el,
+                            alternate_pts=_alts_el)
                     if _el_res is not None:
                         _tip_el, _leg_segs_622 = _el_res
                         _bg_el.target_positions[_k_el] = _tip_el

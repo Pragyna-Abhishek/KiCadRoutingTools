@@ -349,60 +349,95 @@ def plan_landing_berths(pcb_data: PCBData, group, config,
                     _conflict(flat[a][2], flat[b][2]):
                 conf[a].add(b)
                 conf[b].add(a)
-    best = {'count': -1, 'cost': float('inf'), 'picks': {}}
-
-    def _dfs(i, picks, taken, cost, placed):
-        if i == len(order):
-            if (placed, -cost) > (best['count'], -best['cost']):
-                best.update(count=placed, cost=cost, picks=dict(picks))
-            return
-        rem = len(order) - i
-        if placed + rem < best['count'] or \
-                (placed + rem == best['count'] and cost >= best['cost']):
-            return
-        nid = order[i]
-        for ci in slots[nid]:
-            if taken & conf[ci]:
+    # Net-level conflict graph -> connected components, each solved by
+    # its OWN exact DFS: members whose candidates never conflict live in
+    # different ball blocks and don't belong in one search space -- the
+    # component sizes are what keep K=15..51 groups exact instead of
+    # falling back to a greedy that ignores the order term. Inversions
+    # are counted WITHIN a component; cross-component pairs sit on
+    # geometry where the order is forced anyway.
+    net_conf = {nid: set() for nid in order}
+    for a in range(n_c):
+        for b in conf[a]:
+            net_conf[flat[a][0]].add(flat[b][0])
+    comps = []
+    seen_c = set()
+    for nid in order:
+        if nid in seen_c:
+            continue
+        stack, comp = [nid], []
+        while stack:
+            cur = stack.pop()
+            if cur in seen_c:
                 continue
-            s = flat[ci][4]
-            inv = sum(1 for pj in picks.values()
-                      if pj is not None and flat[pj][4] > s)
-            picks[nid] = ci
-            taken.add(ci)
-            _dfs(i + 1, picks, taken, cost + flat[ci][1] + INV_COST * inv,
-                 placed + 1)
-            taken.discard(ci)
-            del picks[nid]
-        picks[nid] = None
-        _dfs(i + 1, picks, taken, cost, placed)
-        del picks[nid]
+            seen_c.add(cur)
+            comp.append(cur)
+            stack.extend(n for n in net_conf[cur] if n not in seen_c)
+        comps.append([n for n in order if n in comp])
 
     import os as _dbg_os
     if _dbg_os.environ.get('KICAD_DBG_BERTHS'):
         for nid in order:
             nm = pcb_data.nets[nid].name.split('/')[-1]
-            print(f"    [berth-dbg] {nm}: " + " | ".join(
-                f"({flat[ci][3][0]:.2f},{flat[ci][3][1]:.2f})"
-                f" c={flat[ci][1]:.2f} s={flat[ci][4]:.2f}"
-                for ci in slots[nid]))
-    if len(order) <= 12:
-        _dfs(0, {}, set(), 0.0, 0)
-        chosen = {nid: (None if ci is None
-                        else (flat[ci][2], flat[ci][3]))
-                  for nid, ci in best['picks'].items()}
-        if _dbg_os.environ.get('KICAD_DBG_BERTHS'):
-            print(f"    [berth-dbg] best count={best['count']} "
-                  f"cost={best['cost']:.2f}")
-    else:
-        chosen = {}
-        for nid in sorted(order, key=lambda nid: len(per_net[nid])):
-            pick = None
-            for run, pts, tip in per_net[nid]:
-                if not any(v is not None and _conflict(pts, v[0])
-                           for v in chosen.values()):
-                    pick = (pts, tip)
-                    break
-            chosen[nid] = pick
+            k = group.net_ids.index(nid)
+            _b = group.target_positions[k]
+            print(f"    [berth-dbg] {nm} ball=({_b[0]:.2f},{_b[1]:.2f}): "
+                  + " | ".join(
+                      f"({flat[ci][3][0]:.2f},{flat[ci][3][1]:.2f})"
+                      f" c={flat[ci][1]:.2f} s={flat[ci][4]:.2f}"
+                      for ci in slots[nid]))
+
+    chosen = {}
+    for order_c in comps:
+        best = {'count': -1, 'cost': float('inf'), 'picks': {}}
+
+        def _dfs(i, picks, taken, cost, placed):
+            if i == len(order_c):
+                if (placed, -cost) > (best['count'], -best['cost']):
+                    best.update(count=placed, cost=cost, picks=dict(picks))
+                return
+            rem = len(order_c) - i
+            if placed + rem < best['count'] or \
+                    (placed + rem == best['count'] and cost >= best['cost']):
+                return
+            nid = order_c[i]
+            for ci in slots[nid]:
+                if taken & conf[ci]:
+                    continue
+                s = flat[ci][4]
+                inv = sum(1 for pj in picks.values()
+                          if pj is not None and flat[pj][4] > s)
+                picks[nid] = ci
+                taken.add(ci)
+                _dfs(i + 1, picks, taken,
+                     cost + flat[ci][1] + INV_COST * inv, placed + 1)
+                taken.discard(ci)
+                del picks[nid]
+            picks[nid] = None
+            _dfs(i + 1, picks, taken, cost, placed)
+            del picks[nid]
+
+        if len(order_c) <= 12:
+            _dfs(0, {}, set(), 0.0, 0)
+            for nid, ci in best['picks'].items():
+                chosen[nid] = None if ci is None \
+                    else (flat[ci][2], flat[ci][3])
+            if _dbg_os.environ.get('KICAD_DBG_BERTHS'):
+                print(f"    [berth-dbg] component {len(order_c)} nets: "
+                      f"count={best['count']} cost={best['cost']:.2f}")
+        else:
+            # component too large for exact search: greedy in candidate-
+            # scarcity order, order term dropped (disclosed).
+            print(f"  Berth plan: component of {len(order_c)} nets "
+                  f"exceeds exact-solve cap; greedy, no order term")
+            for nid in sorted(order_c, key=lambda nid: len(per_net[nid])):
+                pick = None
+                for run, pts, tip in per_net[nid]:
+                    if not any(v is not None and _conflict(pts, v[0])
+                               for v in chosen.values()):
+                        pick = (pts, tip)
+                        break
+                chosen[nid] = pick
     plan = {}
     for nid in n_ids:
         v = chosen.get(nid)
@@ -412,6 +447,18 @@ def plan_landing_berths(pcb_data: PCBData, group, config,
             print(f"  Berth plan: {nm} -> DIVE (no conflict-free berth)")
         else:
             print(f"  Berth plan: {nm} -> tip ({v[1][0]:.2f},{v[1][1]:.2f})")
+    # Alternates for emission-time fallback: a planned leg can be blocked
+    # by earlier siblings' TRUNK copper the plan cannot see. The member
+    # may then use another of its own measured candidates, but only one
+    # that conflicts with NO sibling's planned berth -- the plan stays
+    # authoritative for everyone else (a free-for-all fallback would
+    # resurrect the first-come contention the plan exists to remove).
+    plan['_alternates'] = {
+        nid: [pts for _c, pts, _t in per_net[nid]
+              if not any(o != nid and plan.get(o) is not None
+                         and _conflict(pts, plan[o])
+                         for o in n_ids)]
+        for nid in n_ids}
     return plan
 
 
@@ -419,7 +466,8 @@ def emit_landing_leg(pcb_data: PCBData, net_id: int,
                      ball_xy: Tuple[float, float],
                      approach_from: Tuple[float, float],
                      config,
-                     planned_pts: Optional[list] = None
+                     planned_pts: Optional[list] = None,
+                     alternate_pts: Optional[List[list]] = None
                      ) -> Optional[Tuple[float, float]]:
     """Emit an exact-checked landing leg for `net_id`'s bare ball; returns
     (tip, [Segment, ...]) or None (no emission --
@@ -444,9 +492,24 @@ def emit_landing_leg(pcb_data: PCBData, net_id: int,
         tip = pts[-1]
         if not _leg_clear(pcb_data, pts, config.layers[0],
                           config.track_width, config.clearance, net_id):
-            print(f"  Berth leg BLOCKED at emission: net {net_id} "
-                  f"tip ({tip[0]:.2f},{tip[1]:.2f}) -- no leg (dive)")
-            return None
+            # blocked by trunk copper the plan could not see: try this
+            # member's own alternates (pre-filtered to conflict with no
+            # sibling's planned berth), else dive.
+            for alt in (alternate_pts or []):
+                a = list(alt)
+                if a == pts:
+                    continue
+                if _leg_clear(pcb_data, a, config.layers[0],
+                              config.track_width, config.clearance,
+                              net_id):
+                    print(f"  Berth leg blocked; alternate berth: net "
+                          f"{net_id} tip ({a[-1][0]:.2f},{a[-1][1]:.2f})")
+                    pts, tip = a, a[-1]
+                    break
+            else:
+                print(f"  Berth leg BLOCKED at emission: net {net_id} "
+                      f"tip ({tip[0]:.2f},{tip[1]:.2f}) -- no leg (dive)")
+                return None
     else:
         cands = _leg_candidates(ctx, ball_xy, approach_from)
         for _compat, _run, pts_c, tip in cands:

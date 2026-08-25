@@ -442,8 +442,24 @@ def filter_bus_groups_geometric(pcb_data, bus_groups, config,
         if len(best) < min_members:
             continue
         if len(best) < len(bus.net_ids):
-            kept = [nid for nid in bus.net_ids if nid in set(best)]
-            bus.net_ids = kept
+            # Prune the PARALLEL lists together: net_ids alone leaves
+            # source/target_positions misaligned by one slot per pruned
+            # member, and every downstream consumer that indexes
+            # positions by net_ids.index() then reads a NEIGHBOR's
+            # geometry (measured h8_15: SDQ11 planned its landing at
+            # pruned SA12's ball; 11 of 14 members got no berth). Same
+            # disease as the 835b6dd6 position-sync fix on the take-1
+            # branch.
+            bset = set(best)
+            keep_idx = [i for i, nid in enumerate(bus.net_ids)
+                        if nid in bset]
+            if len(bus.source_positions) == len(bus.net_ids):
+                bus.source_positions = [bus.source_positions[i]
+                                        for i in keep_idx]
+            if len(bus.target_positions) == len(bus.net_ids):
+                bus.target_positions = [bus.target_positions[i]
+                                        for i in keep_idx]
+            bus.net_ids = [bus.net_ids[i] for i in keep_idx]
         out.append(bus)
     return out
 
