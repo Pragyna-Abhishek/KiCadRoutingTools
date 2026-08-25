@@ -222,6 +222,13 @@ def write_routed_output(
         if n_eco:
             print(f"Bus attract debug: {n_eco} line(s) on User.Eco1 "
                   f"(corridors) / User.Eco2 (attraction targets)")
+        # Per-net identity sidecar: the gr_lines are anonymous, so
+        # adherence (copper vs its OWN target) is unmeasurable from the
+        # board alone -- dump the debug dict next to the output.
+        import json as _js622
+        with open(output_file + '.attract.json', 'w',
+                  encoding='utf-8') as _jf622:
+            _js622.dump(_at_dbg, _jf622)
 
     # Insert routing text before final closing paren
     last_paren = content.rfind(')')
