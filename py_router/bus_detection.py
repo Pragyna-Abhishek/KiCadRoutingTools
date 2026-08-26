@@ -1341,7 +1341,8 @@ def bus_river_layer_config(cfg_route, config, group, mult=2.0):
 
 
 def prepare_victim_bus_context(pcb_data, state, net_id, config,
-                               attraction_path, routed_paths):
+                               attraction_path, routed_paths,
+                               obstacles=None):
     """Full bus stack for a rip victim's reroute -- ONE copy shared by
     the reroute loop and both Phase-3 victim sites: landing-leg
     re-emission (the leg was ripped WITH the result), river layer
@@ -1371,7 +1372,8 @@ def prepare_victim_bus_context(pcb_data, state, net_id, config,
                                       '5.0')))
     attraction_path, wps = refine_member_attraction(
         pcb_data, net_id, group, attraction_path,
-        getattr(state, 'bus_corridors', None), routed_paths, config)
+        getattr(state, 'bus_corridors', None), routed_paths, config,
+        obstacles=obstacles)
     if wps:
         from dataclasses import replace as _pv_rep
         cfg = _pv_rep(cfg, corridor_waypoints=list(wps),
@@ -1467,8 +1469,162 @@ def smooth_realized_path(path, eps_cells=2.5, step_cells=1.0):
     return out
 
 
+def _build_lane_repair_padcells(pcb_data, config):
+    """Cell -> owner-net-ids map of every pad's clearance zone, grid-
+    rasterized once per run (pads never move mid-run). Thru-hole pads
+    block all layers; SMD only theirs; NPTH has no copper (skipped).
+    Margin = track/2 + clearance (the cell is unusable for a track
+    center)."""
+    import math as _m
+    gs = config.grid_step
+    margin = config.track_width / 2.0 + config.clearance
+    layers = list(getattr(config, 'layers', None) or [])
+    all_idx = tuple(range(len(layers)))
+    cells = {}
+    for fp in pcb_data.footprints.values():
+        for pad in fp.pads:
+            if pad.pad_type == 'np_thru_hole':
+                continue
+            if pad.drill and pad.drill > 0:
+                lidx = all_idx
+            else:
+                lidx = tuple(i for i, nm in enumerate(layers)
+                             if nm in pad.layers
+                             or any(pl.startswith('*') and pl.endswith('.Cu')
+                                    for pl in pad.layers))
+            if not lidx:
+                continue
+            hx = pad.size_x / 2.0 + margin
+            hy = pad.size_y / 2.0 + margin
+            g0x = int(_m.floor((pad.global_x - hx) / gs))
+            g1x = int(_m.ceil((pad.global_x + hx) / gs))
+            g0y = int(_m.floor((pad.global_y - hy) / gs))
+            g1y = int(_m.ceil((pad.global_y + hy) / gs))
+            for gx in range(g0x, g1x + 1):
+                dx = max(abs(gx * gs - pad.global_x) - pad.size_x / 2.0,
+                         0.0)
+                for gy in range(g0y, g1y + 1):
+                    dy = max(abs(gy * gs - pad.global_y)
+                             - pad.size_y / 2.0, 0.0)
+                    if _m.hypot(dx, dy) >= margin:
+                        continue
+                    for li in lidx:
+                        cells.setdefault((gx, gy, li),
+                                         set()).add(pad.net_id)
+    return cells
+
+
+def repair_lane_feasibility(path, obstacles, config, name='',
+                            pcb_data=None, net_id=None):
+    """#622 lane-feasibility repair (KICAD_BUS_LANE_REPAIR=1, default
+    off): slide statically-blocked attraction-target points to the
+    nearest free lateral cell.
+
+    Measured motivation (K=51 pack arm, awx/rip_census.py +
+    awx/lane_feas.py, 0826): 202 rip events concentrate in the 2mm bins
+    at (124-126, 66-70) -- exactly the bins where planned lane / pack
+    targets run through foreign ball pads (SCS0: 37% of its target
+    blocked; SDQ3/SDQ5: 3.1mm CONTIGUOUS blocked runs -- and those two
+    are the arm's two late-rip failures). The corridor centerline is
+    honestly probed, but its OFFSET copies (ribbon rank lanes, the
+    follower's +1-pitch pack target) are never checked against copper,
+    so they promise positions no search can take; members squeeze into
+    the few real cells and rip each other for them. A corridor-shape
+    gate cannot see this (bus_1_rb wrap-ratio is only 1.08).
+
+    Repair: for each PAD-blocked interior point, try lateral offsets
+    along the local normal out to one ribbon clamp width (4 pitches),
+    preferring the previously-chosen side/distance (coherent runs, not
+    per-point zigzag). Only points inside a FOREIGN PAD's clearance
+    zone are eligible (v2): v1 repaired every blocked point, and at
+    K=30 that slid targets off ROUTED SIBLING copper -- but hugging the
+    leader's copper is the designed pack behavior (attraction is soft;
+    the member packs adjacent), and the win degraded 0/79/0 ->
+    0/88/5-rips. Pads never move mid-run, so pad-blockage is exactly
+    the "promised position that can never exist" class. Terminal zones
+    (~1mm at each end) are exempt: ball-gap lanes are grid-
+    quantization-sealed (0824 lore), so exact-planned landing legs read
+    blocked in the grid map while being feasible in exact geometry --
+    repairing them would shove the landing off its own leg. Points with
+    no free cell in reach keep their position (A* pays, as before)."""
+    import os as _lr_os
+    if _lr_os.environ.get('KICAD_BUS_LANE_REPAIR') in (None, '', '0'):
+        return path
+    if obstacles is None or not path or len(path) < 8 \
+            or pcb_data is None or net_id is None:
+        return path
+    import math as _m
+    padcells = getattr(pcb_data, '_lane_repair_padcells', None)
+    if padcells is None:
+        padcells = _build_lane_repair_padcells(pcb_data, config)
+        pcb_data._lane_repair_padcells = padcells
+    gs = config.grid_step
+    pitch = max(1, int(round((config.track_width + config.clearance) / gs)))
+    max_off = 4 * pitch
+    end_skip = max(4, int(round(1.0 / gs)))
+    n = len(path)
+    out = list(path)
+    prev_choice = None  # (side, dist) continuity between adjacent points
+    n_blocked = n_elig = n_slid = 0
+    max_slide = 0
+    for i in range(end_skip, n - end_skip):
+        x, y, l = out[i]
+        try:
+            if not obstacles.is_blocked(x, y, l):
+                prev_choice = None
+                continue
+        except BaseException:
+            return path  # map/point disagreement: repair declines whole
+        n_blocked += 1
+        owners = padcells.get((x, y, l))
+        if not owners or not (owners - {net_id}):
+            prev_choice = None
+            continue  # blocked, but not by a foreign pad: leave it
+        n_elig += 1
+        a = path[max(0, i - 3)]
+        b = path[min(n - 1, i + 3)]
+        tx, ty = b[0] - a[0], b[1] - a[1]
+        L = _m.hypot(tx, ty)
+        if L < 1e-9:
+            continue
+        nx, ny = -ty / L, tx / L
+        cands = []
+        if prev_choice is not None:
+            cands.append(prev_choice)
+        for d in range(1, max_off + 1):
+            cands.append((1, d))
+            cands.append((-1, d))
+        got = None
+        for side, d in cands:
+            px = int(round(x + nx * side * d))
+            py = int(round(y + ny * side * d))
+            if px < 0 or py < 0:
+                continue
+            try:
+                free = not obstacles.is_blocked(px, py, l)
+            except BaseException:
+                continue
+            if free:
+                got = (side, d, px, py)
+                break
+        if got is not None:
+            side, d, px, py = got
+            out[i] = (px, py, l)
+            prev_choice = (side, d)
+            n_slid += 1
+            max_slide = max(max_slide, d)
+        else:
+            prev_choice = None
+    if n_elig:
+        print(f"  [lane-repair] {name}: {n_slid}/{n_elig} pad-blocked "
+              f"target pt(s) slid (max {max_slide * gs:.2f}mm; "
+              f"{n_blocked} blocked total, non-pad left alone)")
+    return out
+
+
 def refine_member_attraction(pcb_data, net_id, group, attraction_path,
-                             bus_corridors, routed_paths, config):
+                             bus_corridors, routed_paths, config,
+                             obstacles=None):
     """FOLLOW_LEADER terminal refinement, ONE copy shared by the main
     loop and the reroute loop: a member following a routed sibling's
     path gets the polarity-aware LANE target (entry-side offset,
@@ -1484,10 +1640,12 @@ def refine_member_attraction(pcb_data, net_id, group, attraction_path,
     import os as _ra_os
     if attraction_path is None or group is None:
         return attraction_path, None
-    if _ra_os.environ.get('KICAD_BUS_FOLLOW_LEADER') in (None, '', '0'):
-        return attraction_path, None
     nm = (pcb_data.nets[net_id].name if net_id in pcb_data.nets
           else str(net_id))
+    if _ra_os.environ.get('KICAD_BUS_FOLLOW_LEADER') in (None, '', '0'):
+        return repair_lane_feasibility(attraction_path, obstacles,
+                                       config, nm, pcb_data,
+                                       net_id), None
     _nb = get_attraction_neighbor(group, net_id, routed_paths or {})
     if _nb is not None and attraction_path is _nb:
         # Fix B (#622): offset a SMOOTHED copy of the leader's realized
@@ -1498,10 +1656,12 @@ def refine_member_attraction(pcb_data, net_id, group, attraction_path,
         if _tp:
             print(f"  Terminal plan: {nm} lane target ({len(_tp)} pts) "
                   f"from leader path")
-            return _tp, _wps
+            return repair_lane_feasibility(_tp, obstacles, config,
+                                           nm, pcb_data, net_id), _wps
         print(f"  Terminal plan: {nm} DEGENERATE -- smoothed leader "
               f"path kept")
-        return _nb_s, None
+        return repair_lane_feasibility(_nb_s, obstacles, config, nm,
+                                       pcb_data, net_id), None
     if (bus_corridors and group.name in bus_corridors
             and attraction_path is bus_corridors[group.name]):
         _tl, _wps = terminal_leader_target(
@@ -1509,5 +1669,7 @@ def refine_member_attraction(pcb_data, net_id, group, attraction_path,
         if _tl:
             print(f"  Terminal plan: {nm} leader gap leg ({len(_tl)} pts) "
                   f"from corridor")
-            return _tl, _wps
-    return attraction_path, None
+            return repair_lane_feasibility(_tl, obstacles, config,
+                                           nm, pcb_data, net_id), _wps
+    return repair_lane_feasibility(attraction_path, obstacles,
+                                   config, nm, pcb_data, net_id), None

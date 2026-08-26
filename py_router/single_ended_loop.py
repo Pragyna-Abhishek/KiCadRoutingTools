@@ -779,7 +779,8 @@ def route_single_ended_nets(
             from bus_detection import refine_member_attraction
             attraction_path, _leg_wps_622 = refine_member_attraction(
                 pcb_data, net_id, (bus_net_to_group or {}).get(net_id),
-                attraction_path, bus_corridors, bus_routed_paths, config)
+                attraction_path, bus_corridors, bus_routed_paths, config,
+                obstacles=obstacles)
         # #589 v2 owner attraction (KICAD_GLOBAL_PLAN_ATTRACT=1): a net
         # with a planned rough corridor and NO bus corridor is attracted
         # to its own plan -- the global->detailed handoff the repulsion-

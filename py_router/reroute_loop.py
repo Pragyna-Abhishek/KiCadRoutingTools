@@ -183,7 +183,7 @@ def run_reroute_loop(
             (_cfg_rr622, _attr, _leg_segs_rr622, _bg_rr622,
              _ball_rr622) = prepare_victim_bus_context(
                 pcb_data, state, ripped_net_id, config, _attr,
-                routed_net_paths)
+                routed_net_paths, obstacles=obstacles)
             # #572: a ripped forced-link net re-routes its EXACT oracle links
             # -- derived endpoints are model-blind to the exact-fill gap, so
             # a plain reroute here would reconnect arbitrary fragments and
