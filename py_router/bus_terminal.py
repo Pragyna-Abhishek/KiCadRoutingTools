@@ -575,6 +575,147 @@ def ensure_landing_leg(pcb_data: PCBData, group, net_id: int, config):
     return out
 
 
+def emit_group_exit_extensions(pcb_data: PCBData, group, config,
+                               ext_mm: float = 0.8) -> list:
+    """#622 source-side exit protection (user design: 'a smarter attach
+    at U1 that doesn't block later exits'): extend each member's SOURCE
+    tooth straight out by ~ext_mm to a grid-aligned tip, exact-checked
+    and emitted at plan time. The near-comb band then contains only
+    perpendicular spikes; lateral trunks must cross BEYOND the tips,
+    where crossing seals nothing -- hard, targeted protection replacing
+    the 10x stub-proximity field (which bought completion at +35 vias
+    of corridor-wide distortion). Endpoint derivation then starts every
+    member at its extension tip, so the trunk's first move is already
+    outside the funnel.
+
+    Segments ride the member's existing _emitted_leg_segs record (one
+    merge/retraction/liveness path for all planned copper); members
+    without a landing record get one with tip=None (callers must guard
+    the landing-tip config on None). Returns the net ids extended --
+    the caller MUST refresh those nets' obstacle-cache entries (the
+    invisible-legs lesson, w5_51)."""
+    import os as _os
+    if not _os.environ.get('KICAD_BUS_EXACT_LEGS'):
+        return []
+    if getattr(group, '_exit_ext_done', False):
+        return []
+    setattr(group, '_exit_ext_done', True)
+    recs = getattr(group, '_emitted_leg_segs', None)
+    if recs is None:
+        recs = {}
+        setattr(group, '_emitted_leg_segs', recs)
+    grid = getattr(config, 'grid_step', 0.1)
+    ledger = getattr(pcb_data, '_emitted_legs', None)
+    if ledger is None:
+        ledger = []
+        setattr(pcb_data, '_emitted_legs', ledger)
+    emitted = []
+    for k, nid in enumerate(group.net_ids):
+        sx, sy = group.source_positions[k]
+        # source stub free tip: degree-1 endpoint near the source pos,
+        # not anchored at same-net pads/vias
+        segs = [s for s in pcb_data.segments if s.net_id == nid]
+        if not segs:
+            continue
+        from collections import Counter as _C
+        deg = _C()
+        for s in segs:
+            deg[(round(s.start_x, 3), round(s.start_y, 3))] += 1
+            deg[(round(s.end_x, 3), round(s.end_y, 3))] += 1
+        anchors = [(p.global_x, p.global_y)
+                   for p in pcb_data.pads_by_net.get(nid, [])] + \
+                  [(v.x, v.y) for v in pcb_data.vias if v.net_id == nid]
+        best = None
+        for s in segs:
+            for (px, py), (ox, oy) in (((s.start_x, s.start_y),
+                                        (s.end_x, s.end_y)),
+                                       ((s.end_x, s.end_y),
+                                        (s.start_x, s.start_y))):
+                key = (round(px, 3), round(py, 3))
+                if deg[key] != 1:
+                    continue
+                if any((px - ax) ** 2 + (py - ay) ** 2 < 0.07 ** 2
+                       for ax, ay in anchors):
+                    continue
+                d = math.hypot(px - sx, py - sy)
+                if d < 1.5 and (best is None or d < best[0]):
+                    L = math.hypot(px - ox, py - oy)
+                    if L > 1e-6:
+                        best = (d, (px, py),
+                                ((px - ox) / L, (py - oy) / L), s.layer)
+        import os as _ee_os
+        _ee_dbg = bool(_ee_os.environ.get('KICAD_DBG_EXIT_EXT'))
+        if best is None:
+            if _ee_dbg:
+                nm = (pcb_data.nets[nid].name.split('/')[-1]
+                      if nid in pcb_data.nets else str(nid))
+                print(f"    [exitext-dbg] {nm}: no free tip near "
+                      f"({sx:.2f},{sy:.2f})")
+            continue
+        _d, (tx, ty), (dx, dy), lay = best
+        # Exit DIRECTION: the tip's own last segment is unusable -- comb
+        # teeth end in the fanout's off-grid dogbone connectors, whose
+        # skewed vectors (measured (0.9,+-0.3)) drive the extension into
+        # the neighboring tooth and every exact check fails (y2_51:
+        # 13/47 emitted). Use the ESCAPE direction instead: tip minus
+        # the member's own nearest U1 pad, snapped to the nearest
+        # octilinear unit.
+        _own = pcb_data.pads_by_net.get(nid, [])
+        if _own:
+            _pp = min(_own, key=lambda p: (p.global_x - tx) ** 2
+                      + (p.global_y - ty) ** 2)
+            _ex, _ey = tx - _pp.global_x, ty - _pp.global_y
+            _eL = math.hypot(_ex, _ey)
+            if _eL > 1e-6:
+                _ang = math.atan2(_ey, _ex)
+                _oct = round(_ang / (math.pi / 4)) * (math.pi / 4)
+                dx = round(math.cos(_oct))
+                dy = round(math.sin(_oct))
+                _nL = math.hypot(dx, dy) or 1.0
+                dx, dy = dx / _nL, dy / _nL
+        # octilinear, grid-aligned end: extend along the exit direction,
+        # then snap the endpoint to the grid on the moving axis (axis
+        # teeth) or to an equal-delta grid point (45 teeth).
+        ex, ey = tx + dx * ext_mm, ty + dy * ext_mm
+        if abs(dx) < 1e-6:
+            ey = round(ey / grid) * grid
+        elif abs(dy) < 1e-6:
+            ex = round(ex / grid) * grid
+        else:
+            step = round((ex - tx) / (grid * (1 if dx > 0 else -1)))
+            ex = tx + (1 if dx > 0 else -1) * step * grid
+            ey = ty + (1 if dy > 0 else -1) * step * grid
+        pts = [(tx, ty), (round(ex, 6), round(ey, 6))]
+        if math.hypot(pts[1][0] - tx, pts[1][1] - ty) < 2 * grid:
+            if _ee_dbg:
+                print(f"    [exitext-dbg] {nid}: extension too short")
+            continue
+        if not _leg_clear(pcb_data, pts, lay, config.track_width,
+                          config.clearance, nid):
+            if _ee_dbg:
+                nm = (pcb_data.nets[nid].name.split('/')[-1]
+                      if nid in pcb_data.nets else str(nid))
+                print(f"    [exitext-dbg] {nm}: exact check blocked "
+                      f"({tx:.2f},{ty:.2f})+({dx:.1f},{dy:.1f}) {lay}")
+            continue
+        seg = Segment(start_x=pts[0][0], start_y=pts[0][1],
+                      end_x=pts[1][0], end_y=pts[1][1],
+                      width=config.track_width, layer=lay, net_id=nid)
+        pcb_data.segments.append(seg)
+        ledger.append(seg)
+        if nid in recs:
+            _t, _s, _b = recs[nid]
+            recs[nid] = (_t, list(_s) + [seg], _b)
+        else:
+            recs[nid] = (None, [seg], None)
+        group.source_positions[k] = pts[1]
+        emitted.append(nid)
+    if emitted:
+        print(f"  Exit extensions: {len(emitted)} source tooth(s) "
+              f"extended {ext_mm}mm past the comb funnel")
+    return emitted
+
+
 def yield_blocking_legs(pcb_data: PCBData, state, blocked_cells,
                         grid_step: float, bus_net_to_group,
                         routed_results, exclude_net_id: int,
@@ -654,7 +795,9 @@ def yield_blocking_legs(pcb_data: PCBData, state, blocked_cells,
         recs = getattr(group, '_emitted_leg_segs', None)
         if recs and bid in recs:
             _tip, _s2, _ball = recs.pop(bid)
-            if bid in group.net_ids:
+            # exit-only records carry ball=None -- never write None into
+            # the parallel lists (a later bareness test dies on it).
+            if _ball is not None and bid in group.net_ids:
                 group.target_positions[group.net_ids.index(bid)] = _ball
         # refresh the yielded net's obstacle stamps IN PLACE: remove the
         # stale entry (it still stamps the dead leg) and immediately

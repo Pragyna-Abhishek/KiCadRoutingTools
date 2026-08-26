@@ -535,11 +535,22 @@ def route_single_ended_nets(
                 # guides then terminate at the leg tips (fringe mouths)
                 # via ordinary endpoint derivation, and berths are
                 # reserved real copper instead of soft plans.
-                from bus_terminal import emit_group_berth_legs
+                from bus_terminal import (emit_group_berth_legs,
+                                          emit_group_exit_extensions)
                 _leg_ids622 = []
                 for _g622 in bus_groups:
                     _leg_ids622.extend(
                         emit_group_berth_legs(pcb_data, _g622, config))
+                # #622 source-side: exit extensions (KICAD_BUS_EXIT_EXT
+                # mm, 0 = off) -- see emit_group_exit_extensions.
+                import os as _ee_os622
+                _ext_mm622 = float(_ee_os622.environ.get(
+                    'KICAD_BUS_EXIT_EXT', '0') or 0)
+                if _ext_mm622 > 0:
+                    for _g622 in bus_groups:
+                        _leg_ids622.extend(emit_group_exit_extensions(
+                            pcb_data, _g622, config, ext_mm=_ext_mm622))
+                _leg_ids622 = list(dict.fromkeys(_leg_ids622))
                 if _leg_ids622:
                     print(f"  Berth legs emitted at plan time: "
                           f"{len(_leg_ids622)}")
@@ -741,7 +752,10 @@ def route_single_ended_nets(
                 net_id, config)
             if _el_res is not None:
                 _tip_el, _leg_segs_622, _ball_el = _el_res
-                _leg_tip_622 = (_tip_el, (_ball_el[0], _ball_el[1]))
+                # exit-extension-only records carry tip=None (no landing
+                # was planned) -- the landing-tip config must not fire.
+                if _tip_el is not None and _ball_el is not None:
+                    _leg_tip_622 = (_tip_el, (_ball_el[0], _ball_el[1]))
         attraction_path, reverse_direction = bus_attraction_context(
             net_id, bus_net_to_group, bus_corridors, bus_routed_paths)
         # #622 take-2 terminal plan: when follow-leader attraction handed
