@@ -107,9 +107,13 @@ def main():
     # correlated-revert row in test_check_weird: two mirrored numbers agreeing
     # is not evidence that either is right. If this fires, re-measure and
     # update BOTH -- deliberately, not to clear a red.
+    # (20, 24) since e3b41fd3: the tracked corpus grew by the two DDR
+    # bus bench boards (ddr_bus_bench + _src), both healthy and both
+    # firing -- which strengthens the refutation rather than weakening
+    # it. Re-measured deliberately, per the rule two lines up.
     check('the recorded count is still the one that was refuted',
-          measured == (18, 22),
-          f'pinned (18, 22), measured {measured}')
+          measured == (20, 24),
+          f'pinned (20, 24), measured {measured}')
 
     print('and the vector it finds on real damage is not the damage')
     dmg = os.path.join(ROOT, 'wk', 'run7', 'glasgow_revC',

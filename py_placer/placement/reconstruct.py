@@ -1421,7 +1421,7 @@ def airwire_cluster_vectors(state, *, cluster_tol: float = 1.5,
     agreeing within 1.5mm) -- which are this function's defaults, so the
     numbers below are what a plain call returns:
 
-        healthy boards firing          18 of 22, with support up to 112
+        healthy boards firing          20 of 24, with support up to 112
 
     That count is over the boards git TRACKS under kicad_files/ (22), which is
     the only fixed set: the directory also fills with generated boards, so a
