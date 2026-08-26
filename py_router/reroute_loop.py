@@ -188,15 +188,21 @@ def run_reroute_loop(
                     _leg_segs_rr622 = _el_rr[1]
                     print(f"  Landing leg re-emitted for ripped member "
                           f"(tip {_el_rr[0][0]:.2f},{_el_rr[0][1]:.2f})")
-                # Victims re-enter with the leg but the GENTLE economy:
-                # arming stick+5x river costs on rip victims amplified
-                # the cascade (measured n2_51: 74 -> 111 rips, vias 252
-                # -> 277) -- a constrained re-entrant rips others. Same
-                # philosophy as the basin's retry disarm: a locked lane
-                # must never cost completion. River layer stays as a 2x
-                # preference so a victim still leans home.
+                # Victims re-enter with the leg and the river layer
+                # economy but NO stick: stick+5x together amplified the
+                # cascade (n2_51: 74 -> 111 rips, vias up); 5x alone,
+                # decomposed on the pour-free bench, is the completion
+                # arm -- 0 failed and paid crossings 125 (below the
+                # human's 126 on the same nets) vs the gentle 2x's 218
+                # vias / 3 stranded / paid 184. Discipline through the
+                # rip path is what holds the rivers; the gentle dose
+                # let 86 re-entrants defect and diluted the split.
+                # KICAD_BUS_VICTIM_RIVER_MULT overrides for dose A/Bs.
+                import os as _rr_os622
                 _cfg_rr622 = bus_river_layer_config(
-                    config, config, _bg_rr622, mult=2.0)
+                    config, config, _bg_rr622,
+                    mult=float(_rr_os622.environ.get(
+                        'KICAD_BUS_VICTIM_RIVER_MULT', '5.0')))
             # #572: a ripped forced-link net re-routes its EXACT oracle links
             # -- derived endpoints are model-blind to the exact-fill gap, so
             # a plain reroute here would reconnect arbitrary fragments and
