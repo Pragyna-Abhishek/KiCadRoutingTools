@@ -530,6 +530,18 @@ def route_single_ended_nets(
             # of being whatever the guide's solo path happened to be. Soft:
             # groups with no routable rung keep neighbor attraction.
             if config.bus_enabled:
+                # Fix A (#622): emit every planned berth leg NOW, on the
+                # base board, before corridors are probed -- spines and
+                # guides then terminate at the leg tips (fringe mouths)
+                # via ordinary endpoint derivation, and berths are
+                # reserved real copper instead of soft plans.
+                from bus_terminal import emit_group_berth_legs
+                _n_legs622 = sum(
+                    emit_group_berth_legs(pcb_data, _g622, config)
+                    for _g622 in bus_groups)
+                if _n_legs622:
+                    print(f"  Berth legs emitted at plan time: "
+                          f"{_n_legs622}")
                 from bus_corridor import plan_bus_corridors
                 bus_corridors, _demoted = plan_bus_corridors(
                     pcb_data, config, bus_groups, verbose=config.verbose)

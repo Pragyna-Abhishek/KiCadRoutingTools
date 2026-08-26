@@ -1044,6 +1044,78 @@ def retract_victim_leg(pcb_data, group, net_id, leg_segs, ball_xy):
           f"terminal reroute failure")
 
 
+def _rdp2(pts, eps):
+    """2D Ramer-Douglas-Peucker on [(x, y), ...]."""
+    if len(pts) < 3:
+        return list(pts)
+    ax, ay = pts[0]
+    bx, by = pts[-1]
+    dx, dy = bx - ax, by - ay
+    L = math.hypot(dx, dy) or 1e-9
+    worst_d, worst_i = -1.0, 0
+    for i in range(1, len(pts) - 1):
+        px, py = pts[i]
+        d = abs((px - ax) * dy - (py - ay) * dx) / L
+        if d > worst_d:
+            worst_d, worst_i = d, i
+    if worst_d <= eps:
+        return [pts[0], pts[-1]]
+    left = _rdp2(pts[:worst_i + 1], eps)
+    return left[:-1] + _rdp2(pts[worst_i:], eps)
+
+
+def smooth_realized_path(path, eps_cells=2.5, step_cells=1.0):
+    """RDP-smooth a realized 3D grid path per LAYER RUN (layer-change
+    points are preserved exactly), then densify back to ~step_cells
+    spacing so pointwise consumers (terminal_plan_target's per-point
+    offsets, the attraction sampler) see the same density as a raw
+    path. A guide built from the raw path copies every A* kink and
+    post-rip detour into every follower's steering (measured q4_51:
+    the worst guide ran 5.97x its straight-line length -- it was
+    teaching its member to loop)."""
+    if not path or len(path) < 3:
+        return path
+    runs = []
+    cur = [path[0]]
+    for p in path[1:]:
+        if p[2] != cur[-1][2]:
+            runs.append(cur)
+            cur = [p]
+        else:
+            cur.append(p)
+    runs.append(cur)
+    out = []
+    for run in runs:
+        simplified = _rdp2([(p[0], p[1]) for p in run], eps_cells)
+        lay = run[0][2]
+        # OCTILINEAR doglegs (user law: ALL routing stays octilinear):
+        # raw RDP segments are arbitrary-angle, which octilinear copper
+        # cannot ride exactly -- followers staircase around the guide
+        # and pay basin-tax noise. Each simplified segment becomes
+        # 45-degree diagonal + axis-aligned remainder.
+        octo = [simplified[0]]
+        for (x1, y1), (x2, y2) in zip(simplified, simplified[1:]):
+            dx, dy = x2 - x1, y2 - y1
+            d = min(abs(dx), abs(dy))
+            mid = (x1 + d * (1 if dx > 0 else -1 if dx < 0 else 0),
+                   y1 + d * (1 if dy > 0 else -1 if dy < 0 else 0))
+            if mid != (x1, y1) and mid != (x2, y2):
+                octo.append(mid)
+            octo.append((x2, y2))
+        dense = []
+        for (x1, y1), (x2, y2) in zip(octo, octo[1:]):
+            L = math.hypot(x2 - x1, y2 - y1)
+            n = max(1, int(L / step_cells))
+            for i in range(n):
+                t = i / n
+                dense.append((int(round(x1 + t * (x2 - x1))),
+                              int(round(y1 + t * (y2 - y1))), lay))
+        dense.append((int(round(octo[-1][0])),
+                      int(round(octo[-1][1])), lay))
+        out.extend(dense)
+    return out
+
+
 def refine_member_attraction(pcb_data, net_id, group, attraction_path,
                              bus_corridors, routed_paths, config):
     """FOLLOW_LEADER terminal refinement, ONE copy shared by the main
@@ -1067,14 +1139,18 @@ def refine_member_attraction(pcb_data, net_id, group, attraction_path,
           else str(net_id))
     _nb = get_attraction_neighbor(group, net_id, routed_paths or {})
     if _nb is not None and attraction_path is _nb:
+        # Fix B (#622): offset a SMOOTHED copy of the leader's realized
+        # path, not the raw one -- see smooth_realized_path.
+        _nb_s = smooth_realized_path(_nb)
         _tp, _wps = terminal_plan_target(
-            group, net_id, _nb, config, pcb_data) or (None, None)
+            group, net_id, _nb_s, config, pcb_data) or (None, None)
         if _tp:
             print(f"  Terminal plan: {nm} lane target ({len(_tp)} pts) "
                   f"from leader path")
             return _tp, _wps
-        print(f"  Terminal plan: {nm} DEGENERATE -- raw leader path kept")
-        return attraction_path, None
+        print(f"  Terminal plan: {nm} DEGENERATE -- smoothed leader "
+              f"path kept")
+        return _nb_s, None
     if (bus_corridors and group.name in bus_corridors
             and attraction_path is bus_corridors[group.name]):
         _tl, _wps = terminal_leader_target(

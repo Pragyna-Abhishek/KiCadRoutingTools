@@ -107,6 +107,66 @@ def plan_bus_corridors(pcb_data, config, bus_groups: List[BusGroup],
         rep_name = pcb_data.nets[rep].name if rep in pcb_data.nets else str(rep)
         k_max = min(MAX_RUNG, max(1, (len(g.net_ids)) // 2))
         best = None      # (score, k, length, result)
+        # #622 fix A: with plan-time berth legs, probe the TRUNK between
+        # STAND-OFF points in free space instead of the rep's real
+        # terminals -- the inflated rung width otherwise dies with
+        # 'terminal copper would OVERLAP' at the crowded tooth/ball cells
+        # (measured: four rivers lost their corridors at K=51 the moment
+        # legs moved the targets to the fringe). The spine's job is the
+        # highway between the mouths; teeth and legs own the terminals.
+        # Gated on the leg records so default --bus probing is untouched.
+        _ovr_src = _ovr_tgt = None
+        if getattr(g, '_emitted_leg_segs', None) is not None \
+                and rep in g.net_ids:
+            import math as _m622
+            _ki = g.net_ids.index(rep)
+            _sx, _sy = g.source_positions[_ki]
+            _tx, _ty = g.target_positions[_ki]
+            _vx, _vy = _tx - _sx, _ty - _sy
+            _L = _m622.hypot(_vx, _vy)
+            if _L > 2.0:
+                _vx, _vy = _vx / _L, _vy / _L
+                _gs = config.grid_step
+                _lay_nm = getattr(g, 'river_layer', None)
+                _layers = list(config.layers or [])
+                _li = (_layers.index(_lay_nm)
+                       if _lay_nm in _layers else 0)
+
+                def _row(x, y):
+                    gx = int(round(x / _gs))
+                    gy = int(round(y / _gs))
+                    return (gx, gy, _li, gx * _gs, gy * _gs)
+
+                # A fixed 0.6mm stand-off can land amid the comb teeth
+                # (the straight src->tgt line passes THROUGH the comb;
+                # measured -0.059mm overlap at rung 0). Walk outward
+                # until the point is exact-checked clear at the FATTEST
+                # rung's width, so every rung's terminal is legal.
+                from bus_terminal import _leg_clear
+                _lay_name = (_layers[_li] if _li < len(_layers)
+                             else 'F.Cu')
+                _w_max = config.track_width + 2 * k_max * room_mm
+
+                def _clear_pt(x0, y0, dx, dy):
+                    t = 0.6
+                    while t <= 3.01:
+                        # snap to grid FIRST; the rounded point is the
+                        # one the probe actually starts from.
+                        px = round((x0 + dx * t) / _gs) * _gs
+                        py = round((y0 + dy * t) / _gs) * _gs
+                        if _leg_clear(pcb_data,
+                                      [(px, py), (px + 1e-4, py)],
+                                      _lay_name, _w_max,
+                                      config.clearance, rep):
+                            return px, py
+                        t += 0.2
+                    return None
+
+                _ps = _clear_pt(_sx, _sy, _vx, _vy)
+                _pt = _clear_pt(_tx, _ty, -_vx, -_vy)
+                if _ps is not None and _pt is not None:
+                    _ovr_src = [_row(*_ps)]
+                    _ovr_tgt = [_row(*_pt)]
         for k in range(k_max, -1, -1):
             # Probe via the wide-power mechanism: a track k sibling-rooms
             # wider per side keeps that much margin from every obstacle on
@@ -141,7 +201,8 @@ def plan_bus_corridors(pcb_data, config, bus_groups: List[BusGroup],
                     config, g, mult=5.0)
             result = route_net_with_obstacles(
                 pcb_data, rep, cfg_k, probe_map,
-                reverse_direction=(g.clique_endpoint == "target"))
+                reverse_direction=(g.clique_endpoint == "target"),
+                sources_override=_ovr_src, targets_override=_ovr_tgt)
             if not result or result.get('failed') or not result.get('path'):
                 if verbose:
                     print(f"  {g.name}: rung {k} (+{k * room_mm:.2f}mm "

@@ -139,7 +139,8 @@ def _ball_context(pcb_data: PCBData, ball_xy: Tuple[float, float]):
 
 def _leg_candidates(ctx, ball_xy: Tuple[float, float],
                     approach_from: Tuple[float, float],
-                    lane_shifts: int = 1, lane_pitch: float = 0.4):
+                    lane_shifts: int = 1, lane_pitch: float = 0.4,
+                    grid: float = 0.1):
     """Candidate landing legs for one ball, sorted approach-compatible
     first then shortest run: (compat_rank, run, pts, tip) tuples, NOT yet
     exact-checked. lane_shifts>1 adds lane-shifted variants of each gap
@@ -175,8 +176,44 @@ def _leg_candidates(ctx, ball_xy: Tuple[float, float],
         else:
             jog = (gap_line, by + sgn * off)
             tip = (gap_line, tip_u)
+        pts = [(bx, by), jog, tip]
+        # Octilinear grid on-ramp (user law: ALL routing octilinear):
+        # gap lines are ball-pitch geometry, off the routing grid, so a
+        # route attaching at a raw tip needs a tiny any-angle connector
+        # (measured: 29um x 39um segment at SDQ7's berth). Extend the
+        # leg with a 45-degree piece to the nearest grid line and an
+        # axis piece to a GRID-ALIGNED free tip -- routes then land on
+        # the tip exactly.
+        g = grid
+        if exit_x_axis:
+            gy = round(gap_line / g) * g
+            d_lat = abs(gy - gap_line)
+            if d_lat > 1e-9:
+                p45 = (tip_u + sgn * d_lat, gy)
+                pts.append(p45)
+            else:
+                p45 = tip
+            gx = (math.floor(p45[0] / g) if sgn < 0
+                  else math.ceil(p45[0] / g)) * g
+            if abs(gx - p45[0]) > 1e-9:
+                pts.append((gx, gy))
+            tip = (round(gx, 6), round(gy, 6))
+        else:
+            gx = round(gap_line / g) * g
+            d_lat = abs(gx - gap_line)
+            if d_lat > 1e-9:
+                p45 = (gx, tip_u + sgn * d_lat)
+                pts.append(p45)
+            else:
+                p45 = tip
+            gy = (math.floor(p45[1] / g) if sgn < 0
+                  else math.ceil(p45[1] / g)) * g
+            if abs(gy - p45[1]) > 1e-9:
+                pts.append((gx, gy))
+            tip = (round(gx, 6), round(gy, 6))
+        pts[-1] = tip
         run = abs(tip_u - (bx if exit_x_axis else by))
-        return run, [(bx, by), jog, tip], tip
+        return run, pts, tip
 
     # Side order: PACK-FACING first (the tip must face the arriving pack
     # -- nearest-boundary alone sent legs out the far side and the route
@@ -264,7 +301,8 @@ def plan_landing_berths(pcb_data: PCBData, group, config,
         _au = ((appr[0] - bx) / _al, (appr[1] - by) / _al)
         cands = []
         for side_rank, run, pts, tip in _leg_candidates(
-                ctx, ball, appr, lane_shifts=3):
+                ctx, ball, appr, lane_shifts=3,
+                grid=getattr(config, 'grid_step', 0.1)):
             if side_rank >= 2:
                 continue  # never berth out the far side
             ex, ey = pts[-1][0] - pts[-2][0], pts[-1][1] - pts[-2][1]
@@ -470,14 +508,32 @@ def ensure_landing_leg(pcb_data: PCBData, group, net_id: int, config):
     DIVE, or blocked). SHARED by the main loop and the reroute loop --
     a ripped member's leg is ripped with its result, and re-entering
     without re-emission meant every rip demoted the member to a
-    dive-at-the-ball loose net."""
+    dive-at-the-ball loose net.
+
+    With plan-time emission (emit_group_berth_legs), the group carries
+    _emitted_leg_segs: a still-live record returns idempotently (the
+    caller merges the SAME segs into this route's result, which is what
+    keeps the sync from stripping them); a record whose segments were
+    ripped away re-emits and refreshes the record."""
     import os as _os
     if not _os.environ.get('KICAD_BUS_EXACT_LEGS'):
         return None
     if group is None or net_id not in group.net_ids:
         return None
+    recs = getattr(group, '_emitted_leg_segs', None)
+    _true_ball = None
+    if recs is not None and net_id in recs:
+        _tip, _segs, _ball = recs[net_id]
+        _seg_ids = {id(s) for s in pcb_data.segments}
+        if all(id(s) in _seg_ids for s in _segs):
+            return recs[net_id]          # legs still live: idempotent
+        del recs[net_id]                 # ripped away: fall through, re-emit
+        _true_ball = _ball               # target_positions still holds the
+        # OLD TIP after a rip (only terminal retraction re-points it) --
+        # emitting with the tip as the "ball" plants a leg in space.
     k = group.net_ids.index(net_id)
-    tgt = group.target_positions[k]
+    tgt = _true_ball if _true_ball is not None \
+        else group.target_positions[k]
 
     def _bare(nid, t):
         return not any(
@@ -513,7 +569,37 @@ def ensure_landing_leg(pcb_data: PCBData, group, net_id: int, config):
         return None
     tip, segs = res
     group.target_positions[k] = tip
-    return tip, segs, tgt
+    out = (tip, segs, tgt)
+    if recs is not None:
+        recs[net_id] = out
+    return out
+
+
+def emit_group_berth_legs(pcb_data: PCBData, group, config) -> int:
+    """Fix A (#622): emit EVERY planned berth leg at PLAN TIME, on the
+    base board, before corridors are probed and before any member
+    routes. Three things follow by construction: berths are reserved
+    REAL copper (soft plans could be squatted by sibling trunks -- the
+    blocked-at-emission failure mode); every endpoint derivation --
+    corridor probes, member routes, attraction terminal plans -- targets
+    the leg TIP at the field fringe instead of the raw ball deep in the
+    field (measured q4_51: all six spines and 30 of 41 guides ended
+    in-field, dragging followers across the berth zone); and the probe
+    terminal lands in free space instead of a crowded ball/tooth cell
+    (the 'terminal copper would OVERLAP' rung rejections). Returns the
+    number of legs emitted; idempotent per group."""
+    import os as _os
+    if not (_os.environ.get('KICAD_BUS_EXACT_LEGS')
+            and _os.environ.get('KICAD_BUS_BERTHS')):
+        return 0
+    if getattr(group, '_emitted_leg_segs', None) is not None:
+        return 0
+    setattr(group, '_emitted_leg_segs', {})
+    n = 0
+    for nid in list(group.net_ids):
+        if ensure_landing_leg(pcb_data, group, nid, config) is not None:
+            n += 1
+    return n
 
 
 def emit_landing_leg(pcb_data: PCBData, net_id: int,
@@ -565,7 +651,8 @@ def emit_landing_leg(pcb_data: PCBData, net_id: int,
                       f"tip ({tip[0]:.2f},{tip[1]:.2f}) -- no leg (dive)")
                 return None
     else:
-        cands = _leg_candidates(ctx, ball_xy, approach_from)
+        cands = _leg_candidates(ctx, ball_xy, approach_from,
+                            grid=getattr(config, 'grid_step', 0.1))
         for _compat, _run, pts_c, tip in cands:
             pts = [p for i, p in enumerate(pts_c)
                    if i == 0 or math.hypot(p[0] - pts_c[i - 1][0],
