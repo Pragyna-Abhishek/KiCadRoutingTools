@@ -987,3 +987,45 @@ def bus_river_layer_config(cfg_route, config, group, mult=2.0):
               for i, c in enumerate(base)]
     from dataclasses import replace as _rep
     return _rep(cfg_route, layer_costs=shaped)
+
+
+def refine_member_attraction(pcb_data, net_id, group, attraction_path,
+                             bus_corridors, routed_paths, config):
+    """FOLLOW_LEADER terminal refinement, ONE copy shared by the main
+    loop and the reroute loop: a member following a routed sibling's
+    path gets the polarity-aware LANE target (entry-side offset,
+    peel-off truncation, landing leg -- terminal_plan_target); a leader
+    following its corridor gets the gap-leg refinement
+    (terminal_leader_target). Returns (attraction_path, leg_waypoints).
+
+    The reroute loop used to skip this entirely, so every rip victim
+    re-aimed at the RAW centerline -- the exact cell stack its routed
+    siblings occupy -- and ripped them back (measured p3_51: 85 of 111
+    rips originated in the reroute loop; SA0 alone was attacker or
+    victim 27 times)."""
+    import os as _ra_os
+    if attraction_path is None or group is None:
+        return attraction_path, None
+    if not _ra_os.environ.get('KICAD_BUS_FOLLOW_LEADER'):
+        return attraction_path, None
+    nm = (pcb_data.nets[net_id].name if net_id in pcb_data.nets
+          else str(net_id))
+    _nb = get_attraction_neighbor(group, net_id, routed_paths or {})
+    if _nb is not None and attraction_path is _nb:
+        _tp, _wps = terminal_plan_target(
+            group, net_id, _nb, config, pcb_data) or (None, None)
+        if _tp:
+            print(f"  Terminal plan: {nm} lane target ({len(_tp)} pts) "
+                  f"from leader path")
+            return _tp, _wps
+        print(f"  Terminal plan: {nm} DEGENERATE -- raw leader path kept")
+        return attraction_path, None
+    if (bus_corridors and group.name in bus_corridors
+            and attraction_path is bus_corridors[group.name]):
+        _tl, _wps = terminal_leader_target(
+            group, net_id, attraction_path, config, pcb_data) or (None, None)
+        if _tl:
+            print(f"  Terminal plan: {nm} leader gap leg ({len(_tl)} pts) "
+                  f"from corridor")
+            return _tl, _wps
+    return attraction_path, None

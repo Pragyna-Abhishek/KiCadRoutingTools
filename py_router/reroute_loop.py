@@ -203,6 +203,23 @@ def run_reroute_loop(
                     config, config, _bg_rr622,
                     mult=float(_rr_os622.environ.get(
                         'KICAD_BUS_VICTIM_RIVER_MULT', '5.0')))
+                # Reroutes FOLLOW THE PLAN: the same terminal refinement
+                # the main loop applies (lane target from the leader's
+                # realized path / gap leg from the corridor) -- without
+                # it a victim re-aims at the raw centerline its routed
+                # siblings occupy and rips them back (85 of 111 rips
+                # originated here, p3_51).
+                from bus_detection import refine_member_attraction
+                _attr, _wps_rr622 = refine_member_attraction(
+                    pcb_data, ripped_net_id, _bg_rr622, _attr,
+                    getattr(state, 'bus_corridors', None),
+                    routed_net_paths, config)
+                if _wps_rr622:
+                    from dataclasses import replace as _rep_rr622
+                    _cfg_rr622 = _rep_rr622(
+                        _cfg_rr622,
+                        corridor_waypoints=list(_wps_rr622),
+                        bus_leg_waypoints=True)
             # #572: a ripped forced-link net re-routes its EXACT oracle links
             # -- derived endpoints are model-blind to the exact-fill gap, so
             # a plain reroute here would reconnect arbitrary fragments and

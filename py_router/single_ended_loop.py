@@ -713,48 +713,15 @@ def route_single_ended_nets(
         # polarity-aware lane target (offset to the member's lane side,
         # truncated at peel-off, landing leg to its own ball) -- see
         # bus_detection.terminal_plan_target.
+        # Refinement extracted to refine_member_attraction -- ONE copy,
+        # shared with the reroute loop so rip victims re-aim at their
+        # LANE instead of the raw centerline their siblings occupy.
         _leg_wps_622 = None
         if attraction_path is not None:
-            import os as _tp_os
-            if _tp_os.environ.get('KICAD_BUS_FOLLOW_LEADER'):
-                _bg_tp = (bus_net_to_group or {}).get(net_id)
-                if _bg_tp is not None:
-                    from bus_detection import (get_attraction_neighbor,
-                                               terminal_plan_target)
-                    _nb_tp = get_attraction_neighbor(
-                        _bg_tp, net_id, bus_routed_paths or {})
-                    if _nb_tp is not None and attraction_path is _nb_tp:
-                        _tp622, _leg_wps_622 = terminal_plan_target(
-                            _bg_tp, net_id, _nb_tp, config, pcb_data) \
-                            or (None, None)
-                        if _tp622:
-                            attraction_path = _tp622
-                            print(f"  Terminal plan: "
-                                  f"{pcb_data.nets[net_id].name} lane "
-                                  f"target ({len(_tp622)} pts) from "
-                                  f"leader path")
-                        else:
-                            print(f"  Terminal plan: "
-                                  f"{pcb_data.nets[net_id].name} "
-                                  f"DEGENERATE -- raw leader path kept")
-                    elif (bus_corridors
-                          and _bg_tp.name in bus_corridors
-                          and attraction_path
-                          is bus_corridors[_bg_tp.name]):
-                        # Leader case: refine the corridor's terminal so
-                        # the leader enters the ball field through the
-                        # gap, never corner-cutting across a sibling's
-                        # ball face.
-                        from bus_detection import terminal_leader_target
-                        _tl622, _leg_wps_622 = terminal_leader_target(
-                            _bg_tp, net_id, attraction_path, config,
-                            pcb_data) or (None, None)
-                        if _tl622:
-                            attraction_path = _tl622
-                            print(f"  Terminal plan: "
-                                  f"{pcb_data.nets[net_id].name} leader "
-                                  f"gap leg ({len(_tl622)} pts) from "
-                                  f"corridor")
+            from bus_detection import refine_member_attraction
+            attraction_path, _leg_wps_622 = refine_member_attraction(
+                pcb_data, net_id, (bus_net_to_group or {}).get(net_id),
+                attraction_path, bus_corridors, bus_routed_paths, config)
         # #589 v2 owner attraction (KICAD_GLOBAL_PLAN_ATTRACT=1): a net
         # with a planned rough corridor and NO bus corridor is attracted
         # to its own plan -- the global->detailed handoff the repulsion-
