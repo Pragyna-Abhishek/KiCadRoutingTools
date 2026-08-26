@@ -99,6 +99,16 @@ class GridRouteConfig:
     via_drill: float = 0.2  # mm via drill
     grid_step: float = 0.1  # mm grid resolution
     via_cost: int = 75  # grid steps equivalent penalty for via (#586: 50 -> 75)
+    # #622 via discipline: per-path escalating via price in the Rust search
+    # -- the k-th REAL via on a path costs via_cost * (pct/100)^(k-1)
+    # (exponent capped at 6; free through-hole layer changes neither
+    # escalate nor count). Default 125 (x1.25 per additional via, the user-
+    # set global dose; 100 = flat legacy pricing); CLI --via-escalation
+    # takes the multiplier form (1.25). The bus loop RAISES river members
+    # (the take-1 bus-member raise was refuted and NOT ported) so that
+    # mid-run layer ping-pong prices
+    # itself out while the first dive stays at face value.
+    via_escalation_pct: int = 100
     layers: List[str] = field(default_factory=lambda: ['F.Cu', 'B.Cu'])
     max_iterations: int = 200000
     max_probe_iterations: int = 5000  # Quick probe per direction to detect stuck routes

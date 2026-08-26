@@ -442,6 +442,7 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                 via_drill: float = defaults.VIA_DRILL,
                 grid_step: float = 0.1,
                 via_cost: int = 50,
+                via_escalation: float = defaults.VIA_ESCALATION,
                 max_iterations: int = 200000,
                 max_probe_iterations: int = 5000,
                 heuristic_weight: float = defaults.HEURISTIC_WEIGHT,
@@ -1069,6 +1070,8 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
         time_matching=time_matching, time_match_tolerance=time_match_tolerance,
         debug_memory=debug_memory, layer_costs=layer_costs
     )
+    # #622: multiplier form (1.25) -> integer pct the config/Rust side uses
+    config_kwargs['via_escalation_pct'] = int(round(via_escalation * 100))
     config_kwargs['power_tap_neckdown'] = power_tap_neckdown
     config_kwargs['neckdown_length'] = neckdown_length
     config_kwargs['neckdown_taper_length'] = neckdown_taper_length
@@ -5927,6 +5930,9 @@ For differential pair routing, use route_diff.py:
                         help=f"Grid resolution in mm (default: {defaults.GRID_STEP})")
     parser.add_argument("--via-cost", type=int, default=defaults.VIA_COST,
                         help=f"Penalty for placing a via, in 0.1mm grid steps (default: {defaults.VIA_COST} = 5mm of path; mm-equivalent at any --grid-step)")
+    parser.add_argument("--via-escalation", type=float, default=defaults.VIA_ESCALATION,
+                        help=f"Each additional via on one route costs this multiple of the previous "
+                             f"(default: {defaults.VIA_ESCALATION}; 1 = flat pricing)")
     parser.add_argument("--via-proximity-cost", type=int, default=defaults.VIA_PROXIMITY_COST,
                         help=f"Via cost multiplier in stub/BGA proximity zones (default: {defaults.VIA_PROXIMITY_COST}, 0=no extra cost)")
     parser.add_argument("--max-iterations", type=int, default=defaults.MAX_ITERATIONS,
@@ -6574,6 +6580,7 @@ For differential pair routing, use route_diff.py:
                 via_drill=args.via_drill,
                 grid_step=args.grid_step,
                 via_cost=args.via_cost,
+                via_escalation=args.via_escalation,
                 max_iterations=args.max_iterations,
                 max_probe_iterations=args.max_probe_iterations,
                 heuristic_weight=args.heuristic_weight,

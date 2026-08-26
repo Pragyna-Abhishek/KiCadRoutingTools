@@ -312,6 +312,19 @@ src/
 ## Version History
 
 
+### 0.21.3 (2026-08-26)
+
+- `GridRouter` gains `via_escalation_pct` (#622, default 0 = off): the k-th
+  REAL via on a single path costs `via_cost * (pct/100)^(k-1)` (exponent
+  capped at 6); free through-hole layer changes neither escalate nor count.
+  `NodeSlot` carries a `vias: u16` bookkeeping field -- the state key stays
+  `(x, y, layer)`, so via-count-blind g-dedup remains the standard shaping
+  approximation. Driven by `--via-escalation` (default 1.0 = flat; the
+  take-1 branch's 1.25 dose regressed completion on the take-2 stack, so
+  the corpus screen ranks the dose). An `attraction_offset` sibling from
+  the retired experimental branch was deliberately not adopted: the
+  terminal-plan machinery realizes the lane offset geometrically.
+
 ### 0.21.2 (2026-08-23)
 
 - `GridRouter` gains `attraction_basin_pct` (#622, default 0 = off): a

@@ -31,6 +31,7 @@ def get_dialog_settings(dialog):
         'via_drill': dialog.via_drill.GetValue(),
         'grid_step': dialog.grid_step.GetValue(),
         'via_cost': dialog.via_cost.GetValue(),
+        'via_escalation': dialog.via_escalation.GetValue(),
         'max_ripup': dialog.max_ripup.GetValue(),
         'ripup_abandon_metric': dialog.ripup_abandon_metric.GetString(
             dialog.ripup_abandon_metric.GetSelection()),
@@ -310,6 +311,8 @@ def restore_dialog_settings(dialog, settings):
         dialog.grid_step.SetValue(settings['grid_step'])
     if 'via_cost' in settings:
         dialog.via_cost.SetValue(settings['via_cost'])
+    if 'via_escalation' in settings:
+        dialog.via_escalation.SetValue(settings['via_escalation'])
     if 'max_ripup' in settings:
         dialog.max_ripup.SetValue(settings['max_ripup'])
     if 'ripup_abandon_metric' in settings:

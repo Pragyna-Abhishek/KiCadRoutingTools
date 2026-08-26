@@ -96,13 +96,31 @@ def plan_bus_corridors(pcb_data, config, bus_groups: List[BusGroup],
 
     all_member_ids = [nid for g in bus_groups for nid in g.net_ids]
     room_mm = config.track_width + config.clearance
-    probe_map = build_base_obstacle_map(
-        pcb_data, config, all_member_ids,
-        net_clearances=config.net_clearances)
+    # #622 honest per-group probe maps (KICAD_BUS_HONEST_PROBE=1): the
+    # shared map excludes EVERY member's copper, so a probe is blind to
+    # OTHER groups' teeth and plan-time berth legs and can plan its
+    # centerline straight through them (the take-1 colander finding:
+    # corridors violating their own margin inside foreign balls were
+    # exactly the killer groups). Honest mode builds one map per group,
+    # excluding only the probed group's own nets -- N_groups cheap
+    # builds. Off by default: default --bus behavior unchanged pending
+    # the corpus screen.
+    import os as _hp_os
+    _honest = bool(_hp_os.environ.get('KICAD_BUS_HONEST_PROBE'))
+    probe_map = None
+    if not _honest:
+        probe_map = build_base_obstacle_map(
+            pcb_data, config, all_member_ids,
+            net_clearances=config.net_clearances)
 
     print(f"\n=== Bus corridor planning: {len(bus_groups)} group(s), "
-          f"room unit {room_mm:.3f}mm ===")
+          f"room unit {room_mm:.3f}mm"
+          f"{' [honest per-group maps]' if _honest else ''} ===")
     for g in bus_groups:
+        if _honest:
+            probe_map = build_base_obstacle_map(
+                pcb_data, config, list(g.net_ids),
+                net_clearances=config.net_clearances)
         rep = get_bus_routing_order(g)[0]
         rep_name = pcb_data.nets[rep].name if rep in pcb_data.nets else str(rep)
         k_max = min(MAX_RUNG, max(1, (len(g.net_ids)) // 2))

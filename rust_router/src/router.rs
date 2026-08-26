@@ -48,9 +48,15 @@ struct NodeSlot {
     g: i32,      // i32::MAX = unvisited
     parent: u32, // bit 31 = closed; low 31 bits = parent node index or NO_PARENT32
     steps: i32,
+    // #622 via escalation: REAL vias on the best path into this node (free
+    // through-hole layer changes excluded). Bookkeeping only -- the state
+    // key stays (x, y, layer), so two paths differing only in via count
+    // dedup by g (the standard shaping approximation; exact pricing would
+    // need via_count in the key and a multiplied state space).
+    vias: u16,
 }
 
-const EMPTY_SLOT: NodeSlot = NodeSlot { g: i32::MAX, parent: NO_PARENT32, steps: 0 };
+const EMPTY_SLOT: NodeSlot = NodeSlot { g: i32::MAX, parent: NO_PARENT32, steps: 0, vias: 0 };
 
 struct Tile {
     base_x: i32, // cell coords of slot (0, 0)
@@ -174,15 +180,22 @@ impl NodeStore {
     #[inline]
     fn set_source(&mut self, gx: i32, gy: i32, layer: u8, g: i32) {
         let idx = self.ensure_index(gx, gy, layer);
-        *self.slot_mut(idx) = NodeSlot { g, parent: NO_PARENT32, steps: 0 };
+        *self.slot_mut(idx) = NodeSlot { g, parent: NO_PARENT32, steps: 0, vias: 0 };
     }
 
-    /// Relax a node: g + parent + steps written together. Never called on a
-    /// closed node (call sites check the closed flag first).
+    /// Relax a node: g + parent + steps + via count written together. Never
+    /// called on a closed node (call sites check the closed flag first).
     #[inline]
-    fn relax(&mut self, gx: i32, gy: i32, layer: u8, g: i32, parent_idx: u32, steps: i32) {
+    fn relax(&mut self, gx: i32, gy: i32, layer: u8, g: i32, parent_idx: u32,
+             steps: i32, vias: u16) {
         let idx = self.ensure_index(gx, gy, layer);
-        *self.slot_mut(idx) = NodeSlot { g, parent: parent_idx, steps };
+        *self.slot_mut(idx) = NodeSlot { g, parent: parent_idx, steps, vias };
+    }
+
+    /// Real-via count on the best path into a node (0 for source/unvisited).
+    #[inline]
+    fn vias_of(&self, idx: u32) -> u16 {
+        self.slot(idx).vias
     }
 
     /// Reconstruct the path by following parent indices back to the source
@@ -686,6 +699,8 @@ impl GridSearch {
 
         // Steps from source for the start-direction constraint
         let current_steps = self.store.steps_of(current_idx);
+        // #622 via escalation: real vias already on this path (source = 0)
+        let current_via_count = self.store.vias_of(current_idx);
 
         // Previous direction (parent -> current) for turn cost calculation
         let prev_direction: Option<(i32, i32)> = self.store.parent(current_idx).map(|parent_idx| {
@@ -835,7 +850,8 @@ impl GridSearch {
                     if existing_g != i32::MAX {
                         sink.on_revisit();
                     }
-                    self.store.relax(ngx, ngy, current.layer, new_g, current_idx, current_steps + 1);
+                    self.store.relax(ngx, ngy, current.layer, new_g, current_idx,
+                                     current_steps + 1, current_via_count);
                     // Propagate via list to neighbor (same vias since no layer change)
                     if self.opts.via_exclusion_radius > 0 {
                         self.path_vias.insert(neighbor_key, current_vias.clone());
@@ -937,7 +953,24 @@ impl GridSearch {
                 // Zero cost for free via positions (through-hole pads on same net).
                 // S6: is_free_via was recomputed for every destination layer;
                 // free_here is loop-invariant, reuse it.
-                let via_cost = if free_here { 0 } else { router.via_cost };
+                // #622 via escalation (via_escalation_pct > 100): the k-th
+                // REAL via on a path costs via_cost * (pct/100)^(k-1) -- a
+                // path that has already dived pays more for the next hop,
+                // so mid-run layer ping-pong prices itself out while the
+                // first, legitimate dive stays at face value. Free vias
+                // neither escalate nor count. Exponent capped: past 6 the
+                // point is made and i32 stays safe.
+                let via_cost = if free_here {
+                    0
+                } else if router.via_escalation_pct > 100 {
+                    let mut c = router.via_cost as i64;
+                    for _ in 0..current_via_count.min(6) {
+                        c = c * router.via_escalation_pct as i64 / 100;
+                    }
+                    c.min(i32::MAX as i64 / 4) as i32
+                } else {
+                    router.via_cost
+                };
                 let proximity_cost = (obstacles.get_stub_proximity_cost(current.gx, current.gy)
                     + obstacles.get_layer_proximity_cost(current.gx, current.gy, layer as usize))
                     * router.via_proximity_cost;
@@ -971,7 +1004,10 @@ impl GridSearch {
                     if existing_g != i32::MAX {
                         sink.on_revisit();
                     }
-                    self.store.relax(current.gx, current.gy, layer, new_g, current_idx, current_steps);
+                    self.store.relax(current.gx, current.gy, layer, new_g,
+                                     current_idx, current_steps,
+                                     current_via_count
+                                         + if free_here { 0 } else { 1 });
                     // Track via positions (only real vias, not free vias at through-holes)
                     if self.opts.via_exclusion_radius > 0 {
                         if free_here {
@@ -1049,19 +1085,24 @@ pub struct GridRouter {
     // zero, so nothing steers toward the lane). A per-cell cost, not a
     // potential: long off-lane travel pays continuously. 0 = off.
     attraction_basin_pct: i32,
+    // #622 via escalation: per-path escalating via price. 0/100 = off;
+    // 125 = each additional REAL via on a path costs 1.25x the previous
+    // (k-th via = via_cost * (pct/100)^(k-1), exponent capped at 6). Free
+    // through-hole layer changes neither escalate nor count.
+    via_escalation_pct: i32,
 }
 
 #[pymethods]
 impl GridRouter {
     #[new]
-    #[pyo3(signature = (via_cost, h_weight, turn_cost=None, via_proximity_cost=1, vertical_attraction_radius=0, vertical_attraction_bonus=0, layer_costs=None, proximity_heuristic_cost=None, layer_direction_preferences=None, direction_preference_cost=0, attraction_radius=0, attraction_bonus=0, attraction_cross_layer_pct=0, attraction_potential=0, attraction_basin_pct=0))]
+    #[pyo3(signature = (via_cost, h_weight, turn_cost=None, via_proximity_cost=1, vertical_attraction_radius=0, vertical_attraction_bonus=0, layer_costs=None, proximity_heuristic_cost=None, layer_direction_preferences=None, direction_preference_cost=0, attraction_radius=0, attraction_bonus=0, attraction_cross_layer_pct=0, attraction_potential=0, attraction_basin_pct=0, via_escalation_pct=0))]
     pub fn new(via_cost: i32, h_weight: f32, turn_cost: Option<i32>, via_proximity_cost: Option<i32>,
                vertical_attraction_radius: i32, vertical_attraction_bonus: i32,
                layer_costs: Option<Vec<i32>>, proximity_heuristic_cost: Option<i32>,
                layer_direction_preferences: Option<Vec<u8>>, direction_preference_cost: i32,
                attraction_radius: i32, attraction_bonus: i32,
                attraction_cross_layer_pct: i32, attraction_potential: i32,
-               attraction_basin_pct: i32) -> Self {
+               attraction_basin_pct: i32, via_escalation_pct: i32) -> Self {
         Self {
             via_cost,
             h_weight,
@@ -1080,6 +1121,7 @@ impl GridRouter {
             attraction_path_buckets: FxHashMap::default(),
             attraction_potential,
             attraction_basin_pct,
+            via_escalation_pct,
         }
     }
 

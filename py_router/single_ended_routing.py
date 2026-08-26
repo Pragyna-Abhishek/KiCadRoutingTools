@@ -1796,7 +1796,9 @@ def route_net_with_obstacles(pcb_data: PCBData, net_id: int, config: GridRouteCo
                             _basin_ov if (_basin_ov := getattr(
                                 config, 'attraction_basin_override', None))
                             is not None
-                            else env_knobs.GLOBAL_PLAN.get('attract_basin_pct', 0)))
+                            else env_knobs.GLOBAL_PLAN.get('attract_basin_pct', 0)),
+                        via_escalation_pct=getattr(
+                            config, 'via_escalation_pct', 0))
 
     # Set attraction path for bus routing (if provided)
     if attraction_path:
@@ -3714,7 +3716,9 @@ def route_multipoint_main(
                             _basin_ov if (_basin_ov := getattr(
                                 config, 'attraction_basin_override', None))
                             is not None
-                            else env_knobs.GLOBAL_PLAN.get('attract_basin_pct', 0)))
+                            else env_knobs.GLOBAL_PLAN.get('attract_basin_pct', 0)),
+                        via_escalation_pct=getattr(
+                            config, 'via_escalation_pct', 0))
 
     if attraction_path:
         router.set_attraction_path(attraction_path)

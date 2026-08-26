@@ -97,6 +97,7 @@ FLAG_PARAMS = {
     '--hole-to-hole-clearance': 'hole_to_hole_clearance',
     '--board-edge-clearance': 'board_edge_clearance',
     '--via-cost': 'via_cost',
+    '--via-escalation': 'via_escalation',
     '--heuristic-weight': 'heuristic_weight',
     '--turn-cost': 'turn_cost',
     '--diff-pair-gap': 'diff_pair_gap',

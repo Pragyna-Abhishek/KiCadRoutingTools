@@ -659,6 +659,15 @@ class RoutingDialog(wx.Dialog):
         self.via_cost.SetToolTip("Cost penalty for adding vias (higher = fewer layer changes)")
         grid.Add(self.via_cost, 0, wx.EXPAND)
 
+        # Via escalation (#622: k-th via on one route costs this multiple of
+        # the previous; 1 = flat pricing)
+        r = defaults.PARAM_RANGES['via_escalation']
+        grid.Add(wx.StaticText(parent, label="Via Escalation:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.via_escalation = wx.SpinCtrlDouble(parent, min=r['min'], max=r['max'], initial=defaults.VIA_ESCALATION, inc=r['inc'])
+        self.via_escalation.SetDigits(r['digits'])
+        self.via_escalation.SetToolTip("Each additional via on one route costs this multiple of the previous (1 = flat pricing)")
+        grid.Add(self.via_escalation, 0, wx.EXPAND)
+
         # Max rip-up count
         r = defaults.PARAM_RANGES['max_ripup']
         grid.Add(wx.StaticText(parent, label="Max Rip-up:"), 0, wx.ALIGN_CENTER_VERTICAL)
@@ -2534,6 +2543,7 @@ class RoutingDialog(wx.Dialog):
         self.via_drill.SetValue(defaults.VIA_DRILL)
         self.grid_step.SetValue(defaults.GRID_STEP)
         self.via_cost.SetValue(defaults.VIA_COST)
+        self.via_escalation.SetValue(defaults.VIA_ESCALATION)
         self.max_ripup.SetValue(defaults.MAX_RIPUP)
         self.ripup_abandon_metric.SetStringSelection(defaults.RIPUP_ABANDON_METRIC)
         self.ripup_blocker_select.SetStringSelection(defaults.RIPUP_BLOCKER_SELECT)
@@ -2881,6 +2891,7 @@ class RoutingDialog(wx.Dialog):
             'via_drill': self._effective_via_drill(),
             'grid_step': self.grid_step.GetValue(),
             'via_cost': self.via_cost.GetValue(),
+            'via_escalation': self.via_escalation.GetValue(),
             'move_copper_text': self.move_text_check.GetValue(),
             'debug_lines': self.debug_lines_check.GetValue(),
             # Impedance routing
@@ -3411,6 +3422,8 @@ class RoutingDialog(wx.Dialog):
                     via_drill=via_drill,
                     grid_step=config['grid_step'],
                     via_cost=config['via_cost'],
+                    via_escalation=config.get('via_escalation',
+                                              defaults.VIA_ESCALATION),
                     impedance=config.get('impedance'),
                     coplanar_gap=config.get('coplanar_gap', 0.0),
                     coplanar_nets=config.get('coplanar_nets'),

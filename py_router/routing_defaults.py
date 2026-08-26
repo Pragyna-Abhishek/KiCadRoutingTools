@@ -39,6 +39,14 @@ UNBLOCK_REFIT_MARGIN_MM = 0.05  # mm (absolute; NOT a fraction like check_drc's 
 
 # Cost parameters
 VIA_COST = 75  # 50 -> 75: #586 corpus (via75: -8 verdict, DRC -13, and composes with hw 2.3)
+# #622: each additional REAL via on one path costs this multiple of the
+# previous (k-th via = via_cost * VIA_ESCALATION^(k-1); 1.0 = flat legacy
+# pricing). Take-2 port: default 1.0 = OFF -- on the take-2 stack the
+# take-1 dose of 1.25 REGRESSED completion on the bus bench (0 -> 3
+# stranded, rips 62 -> 89; the 1.25 verdict was measured on a different
+# stack). The machinery ships; the corpus screen ranks the dose. The
+# bus-member raise knob was NOT carried (refuted on every metric).
+VIA_ESCALATION = 1.0
 VIA_PROXIMITY_COST = 10
 TURN_COST = 1000
 STUB_PROXIMITY_COST = 0.2
@@ -323,6 +331,7 @@ PARAM_RANGES = {
     'via_drill': {'min': 0.1, 'max': 1.5, 'inc': 0.05, 'digits': 4},
     'grid_step': {'min': 0.01, 'max': 1.0, 'inc': 0.01, 'digits': 4},
     'via_cost': {'min': 1, 'max': 1000},
+    'via_escalation': {'min': 1.0, 'max': 4.0, 'inc': 0.05, 'digits': 2},
     'max_iterations': {'min': 1000, 'max': 100000000},
     'heuristic_weight': {'min': 1.0, 'max': 10.0, 'inc': 0.1, 'digits': 1},
     'proximity_heuristic_factor': {'min': 0.0, 'max': 0.2, 'inc': 0.01, 'digits': 2},
