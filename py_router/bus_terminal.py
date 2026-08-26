@@ -575,6 +575,133 @@ def ensure_landing_leg(pcb_data: PCBData, group, net_id: int, config):
     return out
 
 
+def yield_blocking_legs(pcb_data: PCBData, state, blocked_cells,
+                        grid_step: float, bus_net_to_group,
+                        routed_results, exclude_net_id: int,
+                        radius_cells: float = 8.0):
+    """#622 leg-yield: plan-time berth legs are THIS RUN's reservations,
+    not foreign pre-existing copper -- but until their member routes
+    they carry no result, so the rip attribution classified them as
+    committed-by-an-earlier-step and the ladder surrendered ('no
+    rippable blockers' -> boxed_in_static on nets walled by their own
+    siblings' reservations; measured t8_51: SDQ6 walled by unrouted
+    SCS0's leg while SCS0 stranded too).
+
+    Given the failed search's blocked frontier cells, retract every
+    live leg belonging to an UNROUTED in-scope member whose polyline
+    passes within radius_cells of a blocked cell (frontier cells sit a
+    clearance margin INSIDE the wall, so the radius must cover
+    width+clearance stamps -- measured 5.7 cells to the load-bearing
+    leg at a 138-cell sealed ball pocket): remove the copper,
+    clear the group record (the member re-emits at its own route time,
+    alternates/dive as fallback), re-point the group target at the
+    ball, and scrub the net's obstacle-cache/working-map stamps.
+    Returns the yielded net names (empty list = nothing to yield)."""
+    import os as _ly_os
+    _dbg = bool(_ly_os.environ.get('KICAD_DBG_LEGYIELD'))
+    if not blocked_cells:
+        if _dbg:
+            print("    [legyield-dbg] no blocked cells")
+        return []
+    legs_by_net = {}
+    for s in (getattr(pcb_data, '_emitted_legs', None) or []):
+        legs_by_net.setdefault(s.net_id, []).append(s)
+    if not legs_by_net:
+        if _dbg:
+            print("    [legyield-dbg] no emitted legs ledger")
+        return []
+    live_ids = {id(s) for s in pcb_data.segments}
+    cells = [(c[0], c[1]) for c in blocked_cells]
+    yielded = []
+    for bid, segs in legs_by_net.items():
+        nm_d = (pcb_data.nets[bid].name.split('/')[-1]
+                if bid in pcb_data.nets else str(bid))
+        if bid == exclude_net_id or bid in (routed_results or {}):
+            if _dbg:
+                print(f"    [legyield-dbg] {nm_d}: skip "
+                      f"({'self' if bid == exclude_net_id else 'routed'})")
+            continue
+        group = (bus_net_to_group or {}).get(bid)
+        if group is None:
+            if _dbg:
+                print(f"    [legyield-dbg] {nm_d}: skip (no group)")
+            continue
+        segs = [s for s in segs if id(s) in live_ids]
+        if not segs:
+            if _dbg:
+                print(f"    [legyield-dbg] {nm_d}: skip (legs not live)")
+            continue
+        near = False
+        best_d = 1e9
+        for s in segs:
+            x1, y1 = s.start_x / grid_step, s.start_y / grid_step
+            x2, y2 = s.end_x / grid_step, s.end_y / grid_step
+            for (cx, cy) in cells:
+                d = _pt_seg_d(cx, cy, x1, y1, x2, y2)
+                best_d = min(best_d, d)
+                if d <= radius_cells:
+                    near = True
+                    break
+            if near:
+                break
+        if not near:
+            if _dbg:
+                print(f"    [legyield-dbg] {nm_d}: skip (nearest "
+                      f"blocked cell {best_d:.1f} cells)")
+            continue
+        remove_landing_leg(pcb_data, segs)
+        _tip = _ball = None
+        recs = getattr(group, '_emitted_leg_segs', None)
+        if recs and bid in recs:
+            _tip, _s2, _ball = recs.pop(bid)
+            if bid in group.net_ids:
+                group.target_positions[group.net_ids.index(bid)] = _ball
+        # scrub the yielded net's obstacle stamps so the retry sees the
+        # freed cells (a stale cache entry would re-stamp the dead leg).
+        try:
+            from obstacle_cache import remove_net_obstacles_from_cache
+            if getattr(state, 'working_obstacles', None) is not None \
+                    and getattr(state, 'net_obstacles_cache', None) \
+                    and bid in state.net_obstacles_cache:
+                remove_net_obstacles_from_cache(
+                    state.working_obstacles,
+                    state.net_obstacles_cache[bid])
+                del state.net_obstacles_cache[bid]
+        except Exception:
+            pass
+        nm = (pcb_data.nets[bid].name if bid in pcb_data.nets
+              else str(bid))
+        yielded.append((nm, bid, group, segs, _tip, _ball))
+        print(f"  Leg yield: {nm}'s berth leg retracted (unclaimed "
+              f"reservation walling the frontier); it re-emits at its "
+              f"own route time")
+    return yielded
+
+
+def unyield_legs(pcb_data: PCBData, yielded) -> int:
+    """Transactional undo for yield_blocking_legs: the retry FAILED, so
+    the retraction bought nothing -- put the exact same leg segments
+    back (board unchanged since the yield: pure undo, no re-check),
+    restore the group record and the tip target. Without this a fruitless
+    yield perturbs the whole rest of the run (measured v3_51: one
+    unhelpful yield, +22 vias +25 rips over baseline)."""
+    n = 0
+    for (_nm, bid, group, segs, tip, ball) in yielded:
+        pcb_data.segments.extend(segs)
+        ledger = getattr(pcb_data, '_emitted_legs', None)
+        if ledger is None:
+            ledger = []
+            setattr(pcb_data, '_emitted_legs', ledger)
+        ledger.extend(segs)
+        recs = getattr(group, '_emitted_leg_segs', None)
+        if recs is not None and tip is not None:
+            recs[bid] = (tip, segs, ball)
+        if tip is not None and bid in group.net_ids:
+            group.target_positions[group.net_ids.index(bid)] = tip
+        n += 1
+    return n
+
+
 def emit_group_berth_legs(pcb_data: PCBData, group, config) -> int:
     """Fix A (#622): emit EVERY planned berth leg at PLAN TIME, on the
     base board, before corridors are probed and before any member

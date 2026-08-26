@@ -1665,10 +1665,77 @@ def route_single_ended_nets(
                         print(f"  {_c301}")
                     record_net_event(state, net_id, "preexisting_blockers", {
                         "hint": hint301, "blockers": blockers301})
+                # #622 leg-yield rung: when the wall is an UNROUTED
+                # sibling's plan-time berth leg (this run's own
+                # reservation, misread as pre-existing), retract it and
+                # retry once with the full bus context. Runs FIRST --
+                # it is the cheapest, most-targeted rescue.
+                _rescued = None
+                if bus_net_to_group and _cells301:
+                    from bus_terminal import yield_blocking_legs
+                    _y_recs = yield_blocking_legs(
+                        pcb_data, state, _cells301, config.grid_step,
+                        bus_net_to_group, routed_results, net_id)
+                    _y_names = [t[0] for t in _y_recs]
+                    if _y_names and state.working_obstacles is not None:
+                        _r_ly = route_net_with_obstacles(
+                            pcb_data, net_id, cfg_route,
+                            state.working_obstacles,
+                            attraction_path=attraction_path,
+                            reverse_direction=reverse_direction)
+                        if _r_ly and not _r_ly.get('failed'):
+                            print(f"  LEG-YIELD RESCUE: "
+                                  f"{pcb_data.nets[net_id].name} routed "
+                                  f"after {len(_y_names)} berth leg(s) "
+                                  f"yielded")
+                            record_net_event(
+                                state, net_id, "leg_yield_rescue",
+                                {"yielded": _y_names})
+                            _r_ly['route_length'] = calculate_route_length(
+                                _r_ly['new_segments'],
+                                _r_ly.get('new_vias', []), pcb_data)
+                            results.append(_r_ly)
+                            add_route_to_pcb_data(
+                                pcb_data, _r_ly,
+                                debug_lines=config.debug_lines)
+                            from plane_fragility import \
+                                fragility_on_copper_change
+                            fragility_on_copper_change(
+                                config, pcb_data,
+                                _r_ly.get('new_segments'),
+                                _r_ly.get('new_vias'))
+                            if net_id in remaining_net_ids:
+                                remaining_net_ids.remove(net_id)
+                            routed_net_ids.append(net_id)
+                            routed_results[net_id] = _r_ly
+                            if _r_ly.get('path'):
+                                routed_net_paths[net_id] = _r_ly['path']
+                                if net_id in bus_net_to_group:
+                                    bus_routed_paths[net_id] = _r_ly['path']
+                            track_proximity_cache[net_id] = \
+                                compute_track_proximity_for_net(
+                                    pcb_data, net_id, config, layer_map)
+                            if state.net_obstacles_cache is not None:
+                                update_net_obstacles_after_routing(
+                                    pcb_data, net_id, _r_ly, config,
+                                    state.net_obstacles_cache)
+                                add_net_obstacles_from_cache(
+                                    state.working_obstacles,
+                                    state.net_obstacles_cache[net_id])
+                            invalidate_obstacle_cache(obstacle_cache,
+                                                      net_id)
+                            _rescued = _r_ly
+                        else:
+                            # transactional: a fruitless yield must not
+                            # perturb the rest of the run (v3_51).
+                            from bus_terminal import unyield_legs
+                            unyield_legs(pcb_data, _y_recs)
+                            print(f"  Leg yield reverted (retry failed)")
                 # Tap-relocation rung (#424 planes-first, env-gated): a
                 # walled-in pocket whose wall is a pre-existing plane TAP
                 # gets one-tap surgery before the stub-swap rung.
-                _rescued = _tap_relocation_rescue(
+                if _rescued is None:
+                    _rescued = _tap_relocation_rescue(
                     pcb_data, net_id, config, state, results,
                     routed_net_ids, remaining_net_ids, routed_results,
                     routed_net_paths, track_proximity_cache, layer_map,

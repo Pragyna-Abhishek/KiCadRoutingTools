@@ -615,6 +615,62 @@ def run_reroute_loop(
                                     successful += 1
 
                 if not reroute_succeeded:
+                    # #622 leg-yield (reroute edition): a rip victim
+                    # walled by an UNROUTED sibling's berth leg gets the
+                    # wall retracted and one retry with its full bus
+                    # context (SA2's re-entry died boxed_in_static on
+                    # exactly this, t8_51).
+                    _cells_ly = list(locals().get('blocked_cells') or [])
+                    if _bg_rr622 is not None and _cells_ly \
+                            and state.working_obstacles is not None:
+                        from bus_terminal import yield_blocking_legs
+                        _y_rr_recs = yield_blocking_legs(
+                            pcb_data, state, _cells_ly, config.grid_step,
+                            getattr(state, 'bus_net_to_group', None),
+                            routed_results, ripped_net_id)
+                        _y_rr = [t[0] for t in _y_rr_recs]
+                        if _y_rr:
+                            _r_ly = route_net_with_obstacles(
+                                pcb_data, ripped_net_id, _cfg_rr622,
+                                state.working_obstacles,
+                                attraction_path=_attr,
+                                reverse_direction=_rev)
+                            if _r_ly and not _r_ly.get('failed'):
+                                print(f"  LEG-YIELD RESCUE (reroute): "
+                                      f"{ripped_net_name} routed after "
+                                      f"{len(_y_rr)} leg(s) yielded")
+                                if _leg_segs_rr622:
+                                    _r_ly['new_segments'] = (
+                                        list(_r_ly['new_segments'])
+                                        + list(_leg_segs_rr622))
+                                    _leg_segs_rr622 = None
+                                results.append(_r_ly)
+                                successful += 1
+                                total_iterations += _r_ly['iterations']
+                                record_single_ended_success(
+                                    pcb_data, _r_ly, ripped_net_id,
+                                    config, remaining_net_ids,
+                                    routed_net_ids, routed_net_paths,
+                                    routed_results,
+                                    track_proximity_cache, layer_map)
+                                record_net_event(
+                                    state, ripped_net_id,
+                                    "leg_yield_rescue",
+                                    {"yielded": _y_rr,
+                                     "context": "reroute_loop"})
+                                queued_net_ids.discard(ripped_net_id)
+                                if state.net_obstacles_cache is not None:
+                                    update_net_obstacles_after_routing(
+                                        pcb_data, ripped_net_id, _r_ly,
+                                        config,
+                                        state.net_obstacles_cache)
+                                reroute_succeeded = True
+                            if not reroute_succeeded:
+                                from bus_terminal import unyield_legs
+                                unyield_legs(pcb_data, _y_rr_recs)
+                                print(f"  Leg yield reverted "
+                                      f"(retry failed)")
+                if not reroute_succeeded:
                     if not ripped_items:
                         print(f"  {RED}ROUTE FAILED - no rippable blockers found{RESET}")
                         from routing_diagnostics import static_boxin_hint, condense_hint
