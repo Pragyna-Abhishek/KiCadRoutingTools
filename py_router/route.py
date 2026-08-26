@@ -2713,6 +2713,18 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
                            if _r.get('failed_pads_info')}
     _protect_unfinished |= {nid for _nm, nid in single_ended_nets
                             if nid not in routed_results}
+    # #622 ribbon-v3 snap (take-2 form, KICAD_BUS_SNAP=1): straighten
+    # bus members' trunk chains to their own octilinear RDP before the
+    # cleanup/smoothing pipeline. Opt-in; berth legs/teeth are original
+    # or result copper and survive by the pass's own boundaries.
+    import os as _sn_os622
+    if _sn_os622.environ.get('KICAD_BUS_SNAP') \
+            and not (_ckpt_stop and not _ckpt_cleanup):
+        _bus_ids622 = sorted(getattr(state, 'bus_net_to_group', None)
+                             or {})
+        if _bus_ids622:
+            from pcb_modification import snap_bus_chains
+            snap_bus_chains(results, pcb_data, _bus_ids622, config)
     _cleanup = None if (_ckpt_stop and not _ckpt_cleanup) else run_post_route_cleanup(
         results, pcb_data, sweep_scope_ids, config,
         protect_net_ids=_protect_unfinished,

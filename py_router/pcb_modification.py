@@ -3843,6 +3843,158 @@ def _seg_cross_point(ax, ay, bx, by, cx, cy, dx, dy):
     return (ax + t * rx, ay + t * ry)
 
 
+def snap_bus_chains(results, pcb_data: PCBData, bus_net_ids, config,
+                    eps_ladder=(0.25, 0.12, 0.06)):
+    """#622 ribbon-v3 snap, take-2 form (KICAD_BUS_SNAP=1): replace each
+    bus member's routed trunk chains with the octilinear RDP of
+    themselves -- committed copper is grid A* staircase even when the
+    member rode a clean smoothed guide; this converts the wobble into
+    drawn 45/90 runs. Take-1's version snapped members to offset copies
+    of a ribbon spine plan take-2 does not have; here members already
+    ride berth-ordered smoothed lanes, so SELF-snap is the remaining
+    texture step and needs no plan.
+
+    Mechanics: chains are maximal degree-2 single-layer runs over
+    RESULT-owned segments only (original input copper -- teeth -- is a
+    hard chain boundary; replacing originals would break the
+    restore/pre-existing invariants), stopped at same-net via barrels
+    and pad landings. Chain ENDPOINTS are preserved exactly, so
+    connectivity is safe by construction. The eps ladder retries finer
+    when a heavy simplification cuts a corner into copper the chain
+    hugged (the take-1 lesson); every candidate segment is validated
+    with the exact-geometry checker (bus_terminal._leg_clear -- own-net
+    exempt, crossing-aware). Replacements swap into pcb_data AND the
+    owning results (sync-survival law)."""
+    import os as _sn_os
+    from bus_terminal import _leg_clear
+    from bus_detection import _rdp2
+    from collections import defaultdict
+    stats = {'chains': 0, 'snapped': 0, 'declined': 0, 'seg_delta': 0}
+    owned = {}
+    for r in results:
+        for sg in (r.get('new_segments') or []):
+            owned[id(sg)] = r
+    live = {id(sg) for sg in pcb_data.segments}
+    for nid in bus_net_ids:
+        segs = [sg for sg in pcb_data.segments
+                if sg.net_id == nid and id(sg) in owned
+                and id(sg) in live
+                and math.hypot(sg.end_x - sg.start_x,
+                               sg.end_y - sg.start_y) > 1e-6]
+        if len(segs) < 3:
+            continue
+        vk = lambda x, y: (round(x, 3), round(y, 3))
+        deg = defaultdict(int)
+        by_layer = defaultdict(list)
+        for sg in segs:
+            deg[vk(sg.start_x, sg.start_y)] += 1
+            deg[vk(sg.end_x, sg.end_y)] += 1
+            by_layer[sg.layer].append(sg)
+        stops = {vk(v.x, v.y) for v in pcb_data.vias if v.net_id == nid}
+        stops |= {vk(p.global_x, p.global_y)
+                  for p in pcb_data.pads_by_net.get(nid, [])}
+        # original copper joints are boundaries too
+        for sg in pcb_data.segments:
+            if sg.net_id == nid and id(sg) not in owned:
+                stops.add(vk(sg.start_x, sg.start_y))
+                stops.add(vk(sg.end_x, sg.end_y))
+        for lay, lsegs in by_layer.items():
+            unused = set(id(sg) for sg in lsegs)
+            adj = defaultdict(list)
+            for sg in lsegs:
+                adj[vk(sg.start_x, sg.start_y)].append(sg)
+                adj[vk(sg.end_x, sg.end_y)].append(sg)
+            for sg0 in lsegs:
+                if id(sg0) not in unused:
+                    continue
+                # grow a chain both ways from sg0
+                chain = [sg0]
+                unused.discard(id(sg0))
+                ends = [vk(sg0.start_x, sg0.start_y),
+                        vk(sg0.end_x, sg0.end_y)]
+                for side in (0, 1):
+                    cur = ends[side]
+                    while deg[cur] == 2 and cur not in stops:
+                        nxt = [t for t in adj[cur] if id(t) in unused]
+                        if not nxt:
+                            break
+                        t = nxt[0]
+                        unused.discard(id(t))
+                        if side == 0:
+                            chain.insert(0, t)
+                        else:
+                            chain.append(t)
+                        cur = (vk(t.start_x, t.start_y)
+                               if vk(t.end_x, t.end_y) == cur
+                               else vk(t.end_x, t.end_y))
+                    ends[side] = cur
+                if len(chain) < 3:
+                    continue
+                # ordered vertex list from ends[0] to ends[1]
+                pts = [ends[0]]
+                cur = ends[0]
+                for t in chain:
+                    nxt = (vk(t.end_x, t.end_y)
+                           if vk(t.start_x, t.start_y) == cur
+                           else vk(t.start_x, t.start_y))
+                    pts.append(nxt)
+                    cur = nxt
+                if cur != ends[1] or len(set(pts)) != len(pts):
+                    continue          # mis-ordered / self-touching: skip
+                stats['chains'] += 1
+                width = max(t.width for t in chain)
+                done = False
+                for eps in eps_ladder:
+                    simp = _rdp2(pts, eps)
+                    octo = [simp[0]]
+                    for (x1, y1), (x2, y2) in zip(simp, simp[1:]):
+                        dx, dy = x2 - x1, y2 - y1
+                        d = min(abs(dx), abs(dy))
+                        mid = (x1 + d * (1 if dx > 0 else -1 if dx < 0
+                                         else 0),
+                               y1 + d * (1 if dy > 0 else -1 if dy < 0
+                                         else 0))
+                        if mid != (x1, y1) and mid != (x2, y2):
+                            octo.append(mid)
+                        octo.append((x2, y2))
+                    if len(octo) >= len(pts):
+                        break         # no simplification to gain
+                    if not _leg_clear(pcb_data, octo, lay, width,
+                                      config.clearance, nid):
+                        continue      # corner cut into copper: finer eps
+                    # commit: swap chain -> octo polyline
+                    ids = {id(t) for t in chain}
+                    pcb_data.segments[:] = [
+                        t for t in pcb_data.segments if id(t) not in ids]
+                    for t in chain:
+                        r = owned.get(id(t))
+                        if r is not None:
+                            r['new_segments'] = [
+                                u for u in r['new_segments']
+                                if id(u) is not id(t) and id(u) != id(t)]
+                    host = owned[id(chain[0])]
+                    new_segs = []
+                    for (x1, y1), (x2, y2) in zip(octo, octo[1:]):
+                        ns = Segment(start_x=x1, start_y=y1, end_x=x2,
+                                     end_y=y2, width=width, layer=lay,
+                                     net_id=nid)
+                        new_segs.append(ns)
+                        pcb_data.segments.append(ns)
+                    host['new_segments'] = (list(host['new_segments'])
+                                            + new_segs)
+                    stats['snapped'] += 1
+                    stats['seg_delta'] += len(new_segs) - len(chain)
+                    done = True
+                    break
+                if not done:
+                    stats['declined'] += 1
+    if stats['chains']:
+        print(f"  Bus snap: {stats['snapped']}/{stats['chains']} "
+              f"chain(s) snapped, {stats['declined']} declined, "
+              f"segment delta {stats['seg_delta']}")
+    return stats
+
+
 def smooth_octolinear_chains(results, pcb_data: PCBData, scope_net_ids=None,
                              clearance: float = 0.1,
                              keep_input_copper: bool = False,
