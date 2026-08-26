@@ -627,7 +627,8 @@ def run_reroute_loop(
                         _y_rr_recs = yield_blocking_legs(
                             pcb_data, state, _cells_ly, config.grid_step,
                             getattr(state, 'bus_net_to_group', None),
-                            routed_results, ripped_net_id)
+                            routed_results, ripped_net_id,
+                            config=config)
                         _y_rr = [t[0] for t in _y_rr_recs]
                         if _y_rr:
                             _r_ly = route_net_with_obstacles(
@@ -667,7 +668,8 @@ def run_reroute_loop(
                                 reroute_succeeded = True
                             if not reroute_succeeded:
                                 from bus_terminal import unyield_legs
-                                unyield_legs(pcb_data, _y_rr_recs)
+                                unyield_legs(pcb_data, _y_rr_recs,
+                                             state=state, config=config)
                                 print(f"  Leg yield reverted "
                                       f"(retry failed)")
                 if not reroute_succeeded:

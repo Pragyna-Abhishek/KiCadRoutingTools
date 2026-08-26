@@ -578,7 +578,7 @@ def ensure_landing_leg(pcb_data: PCBData, group, net_id: int, config):
 def yield_blocking_legs(pcb_data: PCBData, state, blocked_cells,
                         grid_step: float, bus_net_to_group,
                         routed_results, exclude_net_id: int,
-                        radius_cells: float = 8.0):
+                        radius_cells: float = 8.0, config=None):
     """#622 leg-yield: plan-time berth legs are THIS RUN's reservations,
     not foreign pre-existing copper -- but until their member routes
     they carry no result, so the rip attribution classified them as
@@ -656,17 +656,27 @@ def yield_blocking_legs(pcb_data: PCBData, state, blocked_cells,
             _tip, _s2, _ball = recs.pop(bid)
             if bid in group.net_ids:
                 group.target_positions[group.net_ids.index(bid)] = _ball
-        # scrub the yielded net's obstacle stamps so the retry sees the
-        # freed cells (a stale cache entry would re-stamp the dead leg).
+        # refresh the yielded net's obstacle stamps IN PLACE: remove the
+        # stale entry (it still stamps the dead leg) and immediately
+        # recompute from post-yield pcb_data -- deleting without
+        # recomputing left the net's TEETH unstamped too, and a later
+        # net could route through them (the copper-only-undo short,
+        # w1_51, was the same disease on the undo side).
         try:
-            from obstacle_cache import remove_net_obstacles_from_cache
+            from obstacle_cache import (remove_net_obstacles_from_cache,
+                                        add_net_obstacles_from_cache,
+                                        precompute_net_obstacles)
             if getattr(state, 'working_obstacles', None) is not None \
                     and getattr(state, 'net_obstacles_cache', None) \
-                    and bid in state.net_obstacles_cache:
+                    is not None and bid in state.net_obstacles_cache:
                 remove_net_obstacles_from_cache(
                     state.working_obstacles,
                     state.net_obstacles_cache[bid])
-                del state.net_obstacles_cache[bid]
+                state.net_obstacles_cache[bid] = \
+                    precompute_net_obstacles(pcb_data, bid, config)
+                add_net_obstacles_from_cache(
+                    state.working_obstacles,
+                    state.net_obstacles_cache[bid])
         except Exception:
             pass
         nm = (pcb_data.nets[bid].name if bid in pcb_data.nets
@@ -678,13 +688,18 @@ def yield_blocking_legs(pcb_data: PCBData, state, blocked_cells,
     return yielded
 
 
-def unyield_legs(pcb_data: PCBData, yielded) -> int:
+def unyield_legs(pcb_data: PCBData, yielded, state=None,
+                 config=None) -> int:
     """Transactional undo for yield_blocking_legs: the retry FAILED, so
     the retraction bought nothing -- put the exact same leg segments
     back (board unchanged since the yield: pure undo, no re-check),
-    restore the group record and the tip target. Without this a fruitless
-    yield perturbs the whole rest of the run (measured v3_51: one
-    unhelpful yield, +22 vias +25 rips over baseline)."""
+    restore the group record and the tip target, AND re-stamp the net's
+    obstacle-cache/working-map entry. The copper-only undo shipped a
+    SHORT: the yield had scrubbed the leg's stamps from the working
+    map, so a later net routed straight through the restored leg
+    (measured w1_51: SDQ9 crossing SDQ12's leg on F.Cu). Without the
+    undo at all, a fruitless yield perturbs the whole rest of the run
+    (v3_51: +22 vias +25 rips)."""
     n = 0
     for (_nm, bid, group, segs, tip, ball) in yielded:
         pcb_data.segments.extend(segs)
@@ -698,11 +713,23 @@ def unyield_legs(pcb_data: PCBData, yielded) -> int:
             recs[bid] = (tip, segs, ball)
         if tip is not None and bid in group.net_ids:
             group.target_positions[group.net_ids.index(bid)] = tip
+        if state is not None and config is not None:
+            try:
+                from obstacle_cache import (precompute_net_obstacles,
+                                            add_net_obstacles_from_cache)
+                if getattr(state, 'net_obstacles_cache', None)                         is not None:
+                    state.net_obstacles_cache[bid] =                         precompute_net_obstacles(pcb_data, bid, config)
+                    if getattr(state, 'working_obstacles', None)                             is not None:
+                        add_net_obstacles_from_cache(
+                            state.working_obstacles,
+                            state.net_obstacles_cache[bid])
+            except Exception:
+                pass
         n += 1
     return n
 
 
-def emit_group_berth_legs(pcb_data: PCBData, group, config) -> int:
+def emit_group_berth_legs(pcb_data: PCBData, group, config) -> list:
     """Fix A (#622): emit EVERY planned berth leg at PLAN TIME, on the
     base board, before corridors are probed and before any member
     routes. Three things follow by construction: berths are reserved
@@ -714,19 +741,23 @@ def emit_group_berth_legs(pcb_data: PCBData, group, config) -> int:
     in-field, dragging followers across the berth zone); and the probe
     terminal lands in free space instead of a crowded ball/tooth cell
     (the 'terminal copper would OVERLAP' rung rejections). Returns the
-    number of legs emitted; idempotent per group."""
+    net ids whose legs were emitted (the caller MUST refresh those nets'
+    obstacle-cache entries: the base map and per-net cache are built
+    BEFORE plan-time emission, so without a refresh the legs are
+    INVISIBLE to the router -- measured w5_51: two A* commits crossed
+    live legs whose stamps never existed). Idempotent per group."""
     import os as _os
     if not (_os.environ.get('KICAD_BUS_EXACT_LEGS')
             and _os.environ.get('KICAD_BUS_BERTHS')):
-        return 0
+        return []
     if getattr(group, '_emitted_leg_segs', None) is not None:
-        return 0
+        return []
     setattr(group, '_emitted_leg_segs', {})
-    n = 0
+    emitted = []
     for nid in list(group.net_ids):
         if ensure_landing_leg(pcb_data, group, nid, config) is not None:
-            n += 1
-    return n
+            emitted.append(nid)
+    return emitted
 
 
 def emit_landing_leg(pcb_data: PCBData, net_id: int,

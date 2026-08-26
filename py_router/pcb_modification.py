@@ -5706,6 +5706,39 @@ def add_route_to_pcb_data(pcb_data: PCBData, result: dict, debug_lines: bool = F
     new_segments = result['new_segments']
     if not new_segments:
         return
+    # #622 commit-time crossing canary (KICAD_DBG_CROSS_CANARY=1): every
+    # commit path funnels through here, so a same-layer different-net
+    # crossing detected NOW names the exact commit that lays the short
+    # -- log archaeology after the fact could not (measured: an
+    # SDQ9xSDQ12 short whose every candidate writer had a crossing-aware
+    # guard). Debug-only: O(new x board) per commit.
+    import os as _cc_os
+    if _cc_os.environ.get('KICAD_DBG_CROSS_CANARY'):
+        import sys as _cc_sys
+        _rid = result.get('net_id')
+        for _ns in new_segments:
+            for _os_ in pcb_data.segments:
+                if _os_.net_id == _ns.net_id or _os_.layer != _ns.layer:
+                    continue
+                _d1x, _d1y = _ns.end_x - _ns.start_x, _ns.end_y - _ns.start_y
+                _d2x, _d2y = _os_.end_x - _os_.start_x, _os_.end_y - _os_.start_y
+                _den = _d1x * _d2y - _d1y * _d2x
+                if abs(_den) < 1e-12:
+                    continue
+                _t = ((_os_.start_x - _ns.start_x) * _d2y
+                      - (_os_.start_y - _ns.start_y) * _d2x) / _den
+                _s = ((_os_.start_x - _ns.start_x) * _d1y
+                      - (_os_.start_y - _ns.start_y) * _d1x) / _den
+                if 1e-6 < _t < 1 - 1e-6 and 1e-6 < _s < 1 - 1e-6:
+                    _cal = _cc_sys._getframe(1).f_code.co_name
+                    print(f"  [cross-canary] COMMIT by {_cal} "
+                          f"(trace_event={trace_event}) net "
+                          f"{_ns.net_id} seg ({_ns.start_x:.2f},"
+                          f"{_ns.start_y:.2f})->({_ns.end_x:.2f},"
+                          f"{_ns.end_y:.2f}) {_ns.layer} CROSSES net "
+                          f"{_os_.net_id} ({_os_.start_x:.2f},"
+                          f"{_os_.start_y:.2f})->({_os_.end_x:.2f},"
+                          f"{_os_.end_y:.2f})")
     # #658 in-run river packing: pack the FRESH route's runs against
     # committed sibling runs BEFORE this copper becomes an obstacle.
     # trace_event 'route' only -- a RESTORE must re-land the original

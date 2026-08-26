@@ -536,12 +536,36 @@ def route_single_ended_nets(
                 # via ordinary endpoint derivation, and berths are
                 # reserved real copper instead of soft plans.
                 from bus_terminal import emit_group_berth_legs
-                _n_legs622 = sum(
-                    emit_group_berth_legs(pcb_data, _g622, config)
-                    for _g622 in bus_groups)
-                if _n_legs622:
+                _leg_ids622 = []
+                for _g622 in bus_groups:
+                    _leg_ids622.extend(
+                        emit_group_berth_legs(pcb_data, _g622, config))
+                if _leg_ids622:
                     print(f"  Berth legs emitted at plan time: "
-                          f"{_n_legs622}")
+                          f"{len(_leg_ids622)}")
+                    # The base map / per-net obstacle cache predate the
+                    # emission -- refresh every leg-bearing net's entry
+                    # or the legs are INVISIBLE to the router (w5_51:
+                    # A* routed straight through two live legs).
+                    if state.net_obstacles_cache is not None:
+                        from obstacle_cache import (
+                            precompute_net_obstacles,
+                            remove_net_obstacles_from_cache,
+                            add_net_obstacles_from_cache)
+                        for _lid622 in _leg_ids622:
+                            _old_e = state.net_obstacles_cache.get(_lid622)
+                            if _old_e is not None \
+                                    and state.working_obstacles is not None:
+                                remove_net_obstacles_from_cache(
+                                    state.working_obstacles, _old_e)
+                            state.net_obstacles_cache[_lid622] = \
+                                precompute_net_obstacles(
+                                    pcb_data, _lid622, config)
+                            if _old_e is not None \
+                                    and state.working_obstacles is not None:
+                                add_net_obstacles_from_cache(
+                                    state.working_obstacles,
+                                    state.net_obstacles_cache[_lid622])
                 from bus_corridor import plan_bus_corridors
                 bus_corridors, _demoted = plan_bus_corridors(
                     pcb_data, config, bus_groups, verbose=config.verbose)
@@ -1675,7 +1699,8 @@ def route_single_ended_nets(
                     from bus_terminal import yield_blocking_legs
                     _y_recs = yield_blocking_legs(
                         pcb_data, state, _cells301, config.grid_step,
-                        bus_net_to_group, routed_results, net_id)
+                        bus_net_to_group, routed_results, net_id,
+                        config=config)
                     _y_names = [t[0] for t in _y_recs]
                     if _y_names and state.working_obstacles is not None:
                         _r_ly = route_net_with_obstacles(
@@ -1729,7 +1754,8 @@ def route_single_ended_nets(
                             # transactional: a fruitless yield must not
                             # perturb the rest of the run (v3_51).
                             from bus_terminal import unyield_legs
-                            unyield_legs(pcb_data, _y_recs)
+                            unyield_legs(pcb_data, _y_recs, state=state,
+                                         config=config)
                             print(f"  Leg yield reverted (retry failed)")
                 # Tap-relocation rung (#424 planes-first, env-gated): a
                 # walled-in pocket whose wall is a pre-existing plane TAP
