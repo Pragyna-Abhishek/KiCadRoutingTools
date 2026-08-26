@@ -73,6 +73,8 @@ REFUSED_TOOLS = {
 
 # CLI flag -> plan params key (numbers parsed; lists collected).
 FLAG_PARAMS = {
+    # #622 part B: chain-level bus replan source board (a path).
+    '--bus-replan-from': 'bus_replan_from',
     '--track-width': 'track_width',
     '--clearance': 'clearance',
     '--via-size': 'via_size',

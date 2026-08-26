@@ -724,6 +724,10 @@ def emit_group_exit_extensions(pcb_data: PCBData, group, config,
         # octilinear, grid-aligned end: extend along the exit direction,
         # then snap the endpoint to the grid on the moving axis (axis
         # teeth) or to an equal-delta grid point (45 teeth).
+        # (A +0.5mm length STAGGER was tried here to split the tip wall
+        # into two combs and measured HARMFUL both stacks -- baseline
+        # 0/202 -> 0/252, rips 62 -> 100: the longer teeth reach into
+        # the trunk band. The uniform wall is load-bearing.)
         ex, ey = tx + dx * ext_mm, ty + dy * ext_mm
         if abs(dx) < 1e-6:
             ey = round(ey / grid) * grid

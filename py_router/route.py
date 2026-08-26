@@ -5962,6 +5962,17 @@ For differential pair routing, use route_diff.py:
                         help=f"Cost bonus for staying near neighbor track (default: {defaults.BUS_ATTRACTION_BONUS})")
     parser.add_argument("--bus-min-nets", type=int, default=defaults.BUS_MIN_NETS,
                         help=f"Minimum nets to form a bus group (default: {defaults.BUS_MIN_NETS})")
+    parser.add_argument("--bus-replan-from", type=str, default=None,
+                        nargs='?', const='', metavar="ROUTED_BOARD",
+                        help="#622 part B: learn the bus plan (river layers/"
+                             "order/corridors) from a previously ROUTED board "
+                             "at the start of this route step and route with "
+                             "it. Bare flag = learn from the INPUT board "
+                             "itself (pair with --force-reroute to rip and "
+                             "re-lay the scope with its own learned plan). "
+                             "Writes <output>.busplan.json. Chain-level "
+                             "iteration; no non-regression guarantee -- "
+                             "compare the boards and keep the better one.")
     parser.add_argument("--guide-corridor", action="store_true",
                         help="Steer routed nets along a guide polyline drawn on a User layer (issue #7)")
     parser.add_argument("--guide-corridor-layer", type=str, default=defaults.GUIDE_CORRIDOR_LAYER,
@@ -6428,6 +6439,25 @@ For differential pair routing, use route_diff.py:
               f"for stray whitespace or a stale net list. First few: "
               f"{', '.join(repr(n) for n in net_names[:5])}", file=sys.stderr)
         sys.exit(2)
+
+    # #622 part B (--bus-replan-from): learn the bus plan from a
+    # previously routed board NOW, at the start of the route step, and
+    # hand it to bus detection via the same KICAD_BUS_PLAN_FILE channel
+    # the standalone bus_replan.py CLI feeds. The plan sidecar lands
+    # next to the output so the chain step is inspectable/replayable.
+    if getattr(args, 'bus_replan_from', None) is not None:
+        import json as _bp_json
+        from kicad_parser import parse_kicad_pcb as _bp_parse
+        from bus_replan import analyze_board as _bp_analyze
+        _bp_src = args.bus_replan_from or args.input_file
+        _bp_board = _bp_parse(_bp_src)
+        _bp_plan = _bp_analyze(_bp_board, net_names)
+        _bp_path = args.output_file + '.busplan.json'
+        with open(_bp_path, 'w', encoding='utf-8') as _bp_f:
+            _bp_json.dump(_bp_plan, _bp_f, indent=1)
+        os.environ['KICAD_BUS_PLAN_FILE'] = _bp_path
+        print(f"Bus replan: learned {len(_bp_plan['nets'])} net(s) from "
+              f"{_bp_src} -> {_bp_path}")
 
     # --undo: strip the scoped nets' copper instead of routing them.
     if args.undo:

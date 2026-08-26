@@ -484,6 +484,14 @@ def route_single_ended_nets(
             bus_groups = split_groups_to_layer_rivers(
                 pcb_data, bus_groups, config)
 
+        # #622 part B, decorate mode (KICAD_BUS_PLAN_MODE=decorate):
+        # max-cut keeps layer/membership; the plan contributes each
+        # river's realized member ORDER and its corridor reference.
+        if bus_groups:
+            from bus_detection import decorate_groups_from_plan
+            bus_groups = decorate_groups_from_plan(
+                pcb_data, bus_groups, config)
+
         if bus_groups:
             print(f"\n=== Bus Detection: Found {len(bus_groups)} bus group(s) ===")
             for bus in bus_groups:
@@ -852,8 +860,15 @@ def route_single_ended_nets(
         _bg_riv622 = (bus_net_to_group or {}).get(net_id)
         if _bg_riv622 is not None:
             from bus_detection import bus_river_layer_config
-            cfg_route = bus_river_layer_config(cfg_route, config,
-                                               _bg_riv622, mult=5.0)
+            cfg_route = bus_river_layer_config(
+                cfg_route, config, _bg_riv622,
+                mult=float(os.environ.get('KICAD_BUS_RIVER_MULT',
+                                          '5.0')))
+            if os.environ.get('KICAD_DBG_RIVER_COSTS'):
+                print(f"    [river-dbg] {pcb_data.nets[net_id].name} "
+                      f"group {_bg_riv622.name} layer "
+                      f"{getattr(_bg_riv622, 'river_layer', None)} "
+                      f"-> layer_costs {cfg_route.layer_costs}")
         # #572: oracle forced links outrank endpoint derivation -- the
         # model's zone credit merges the exact-fill clusters, so both the
         # multipoint and plain derivations "see" no gap and succeed with

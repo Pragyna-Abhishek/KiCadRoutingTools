@@ -316,7 +316,7 @@ def get_bus_routing_order(bus: BusGroup) -> List[int]:
     # (e3_2 SDQ0); deep-first, the shallow member lands short of the
     # deep one's copper for free. Also how a human fills a comb.
     import os as _do_os
-    if _do_os.environ.get('KICAD_BUS_FOLLOW_LEADER'):
+    if _do_os.environ.get('KICAD_BUS_FOLLOW_LEADER') not in (None, '', '0'):
         import math as _do_m
         n_ = float(n)
         scx = sum(p[0] for p in bus.source_positions) / n_
@@ -501,6 +501,46 @@ def net_teeth_common_layer(pcb_data, net_id) -> Optional[str]:
     if n_tips < 2 or len(tip_layers) != 1:
         return None
     return next(iter(tip_layers))
+
+
+def net_end_attach_layers(pcb_data, net_id, radius=2.5):
+    """Per-terminal ATTACH-LAYER sets: for each pad of the net, the
+    copper layers a trunk can reach that terminal on without adding a
+    via. A stub near the pad contributes its layer; a same-net VIA near
+    the pad (a dogbone) contributes its whole span -- the via is a free
+    layer change the router already owns; a bare pad contributes its
+    own copper layers (a BGA ball = the surface layer only).
+
+    This is the terminal truth net_teeth_common_layer cannot see on a
+    dogbone fanout (#622 K=30 microscope: pad->stub->via has NO free
+    tip, so every tooth read None and the macro-river max-cut priced
+    terminal reality at ZERO -- it assigned 9 members to a B river
+    whose every member pays an unpriced dive at its F-locked ball end,
+    and 8 of the 9 defected)."""
+    pads = pcb_data.pads_by_net.get(net_id, [])
+    segs = [s for s in pcb_data.segments if s.net_id == net_id]
+    vias = [v for v in pcb_data.vias if v.net_id == net_id]
+    copper = set(pcb_data.board_info.copper_layers or [])
+    r2 = radius * radius
+    out = []
+    for p in pads:
+        px, py = p.global_x, p.global_y
+        lays = set()
+        for s in segs:
+            if (s.start_x - px) ** 2 + (s.start_y - py) ** 2 <= r2 or \
+                    (s.end_x - px) ** 2 + (s.end_y - py) ** 2 <= r2:
+                lays.add(s.layer)
+        for v in vias:
+            if (v.x - px) ** 2 + (v.y - py) ** 2 <= r2:
+                span = set(v.layers or []) & copper
+                lays.update(span if span else copper)
+        if not lays:
+            if getattr(p, 'drill', 0) and p.pad_type != 'np_thru_hole':
+                lays = set(copper)
+            else:
+                lays = {l for l in (p.layers or []) if l in copper}
+        out.append(lays)
+    return out
 
 
 def replan_groups_from_board(pcb_data, bus_groups):
@@ -787,13 +827,129 @@ def bus_attraction_context(
     # shared-centerline attraction left members 2-3mm apart because two
     # tracks cannot both occupy the centerline, measured at K=2).
     import os as _fl_os
-    if _fl_os.environ.get('KICAD_BUS_FOLLOW_LEADER'):
+    if _fl_os.environ.get('KICAD_BUS_FOLLOW_LEADER') not in (None, '', '0'):
         _nb = get_attraction_neighbor(bg, net_id, routed_paths or {})
         if _nb is not None:
             return _nb, (bg.clique_endpoint == "target")
-    attr = ((bus_corridors or {}).get(bg.name)
-            or get_attraction_neighbor(bg, net_id, routed_paths or {}))
+    attr = (bus_corridors or {}).get(bg.name)
+    if attr is not None and _fl_os.environ.get('KICAD_BUS_RIBBON'):
+        # #622 ribbon: the member gets its OWN LANE (centerline offset
+        # by rank at pitch, planned dive layering at the ends) instead
+        # of the shared centerline every member fights over
+        attr = member_lane_path(bg, net_id, attr)
+    if attr is None:
+        attr = get_attraction_neighbor(bg, net_id, routed_paths or {})
     return attr, (bg.clique_endpoint == "target")
+
+
+def prepare_ribbon_plan(pcb_data, config, group, path_cells):
+    """#622 realism fixes 1+2: turn the group's corridor CENTERLINE into
+    a per-member RIBBON plan (a lane per member at track+clearance
+    pitch, ordered like the group's physical order) and plan the DIVE
+    POINTS (where a member whose terminal cannot attach on the river
+    layer changes layer -- encoded as the lane path's layer sequence, so
+    the layer-aware attraction steers the dive instead of every member
+    improvising its transition in the mouth and paying excursions;
+    measured K=30: ~4 extra mid-vias per river member vs the human's
+    2). Stored on the group as `_ribbon`; consumed by
+    bus_attraction_context when KICAD_BUS_RIBBON=1."""
+    import math as _m
+    n = len(group.net_ids)
+    if n < 2 or not path_cells or len(path_cells) < 2:
+        return
+    gs = config.grid_step
+    pitch = (config.track_width + config.clearance) / gs
+
+    def _side(pt_mm):
+        cx, cy = pt_mm[0] / gs, pt_mm[1] / gs
+        j = min(range(len(path_cells)),
+                key=lambda i: (path_cells[i][0] - cx) ** 2
+                + (path_cells[i][1] - cy) ** 2)
+        j2 = min(j + 1, len(path_cells) - 1)
+        j1 = max(j - 1, 0)
+        tx = path_cells[j2][0] - path_cells[j1][0]
+        ty = path_cells[j2][1] - path_cells[j1][1]
+        return ((cx - path_cells[j][0]) * (-ty)
+                + (cy - path_cells[j][1]) * tx)
+
+    # lane-order sign: the first member's lane lands on the first
+    # member's side of the centerline
+    s_first = _side(group.source_positions[0])
+    s_last = _side(group.source_positions[-1])
+    sign = 1.0 if s_first <= s_last else -1.0
+    # dive plan per member and path end: the layer a trunk can attach
+    # on at that terminal without a via (net_end_attach_layers); when
+    # the river layer is not in the set, the lane's terminal stretch
+    # rides the attach layer and the switch point IS the planned dive
+    layers = list(getattr(config, 'layers', None) or [])
+    dive = {}
+    for nid in group.net_ids:
+        pads = pcb_data.pads_by_net.get(nid, [])
+        if not pads:
+            continue
+        attach = net_end_attach_layers(pcb_data, nid)
+        ends = []
+        for e in (0, -1):
+            ex, ey = (path_cells[e][0] * gs, path_cells[e][1] * gs)
+            li = path_cells[e][2]
+            river_nm = layers[li] if 0 <= li < len(layers) else None
+            k = min(range(len(pads)),
+                    key=lambda i: (pads[i].global_x - ex) ** 2
+                    + (pads[i].global_y - ey) ** 2)
+            aset = attach[k] if k < len(attach) else set()
+            if river_nm and aset and river_nm not in aset \
+                    and len(aset) == 1:
+                nm = next(iter(aset))
+                ends.append(layers.index(nm) if nm in layers else None)
+            else:
+                ends.append(None)
+        if ends[0] is not None or ends[1] is not None:
+            dive[nid] = tuple(ends)
+    group._ribbon = {'pitch': pitch, 'sign': sign, 'dive': dive,
+                     'run': max(4, int(round(0.8 / gs)))}
+
+
+def member_lane_path(group, net_id, path_cells):
+    """The member's OWN lane from the group ribbon plan: the corridor
+    centerline offset laterally by the member's rank at pitch, with the
+    planned dive layering applied at the ends. Falls back to the
+    centerline when no ribbon plan exists."""
+    import math as _m
+    rp = getattr(group, '_ribbon', None)
+    if not rp or net_id not in group.net_ids or len(path_cells) < 2:
+        return path_cells
+    n = len(group.net_ids)
+    rank = group.net_ids.index(net_id)
+    off = rp['sign'] * (rank - (n - 1) / 2.0) * rp['pitch']
+    # capacity clamp: a too-wide ribbon cannot fit the necks the
+    # corridor was probed through (K=51: a 15-member river's 6.3mm
+    # ribbon turned the lanes into an obstacle fight -- 4 failed / 90
+    # rips); outer members share the edge lanes instead. Cap 4 pitches:
+    # a 9-member river (rank offsets to +-4) fits UNCLAMPED -- the
+    # measured K=30 win (0 failed / 79 vias / 0 rips) needs exactly
+    # that, and a 3-pitch cap that clipped it cost 89 vias / 5 rips.
+    _cap = 4.0 * rp['pitch']
+    off = max(-_cap, min(_cap, off))
+    out = []
+    for i, (x, y, l) in enumerate(path_cells):
+        j2 = min(i + 1, len(path_cells) - 1)
+        j1 = max(i - 1, 0)
+        tx = path_cells[j2][0] - path_cells[j1][0]
+        ty = path_cells[j2][1] - path_cells[j1][1]
+        L = _m.hypot(tx, ty)
+        if L < 1e-9:
+            out.append((x, y, l))
+            continue
+        out.append((int(round(x - ty / L * off)),
+                    int(round(y + tx / L * off)), l))
+    ends = rp['dive'].get(net_id)
+    if ends:
+        run = rp['run']
+        if ends[0] is not None:
+            out[:run] = [(p[0], p[1], ends[0]) for p in out[:run]]
+        if ends[1] is not None:
+            out[-run:] = [(p[0], p[1], ends[1]) for p in out[-run:]]
+    return out
 
 
 def _principal_scalar(points):
@@ -814,6 +970,151 @@ def _principal_scalar(points):
     L = _m.hypot(*ax) or 1.0
     ux, uy = ax[0] / L, ax[1] / L
     return [(p[0] - mx) * ux + (p[1] - my) * uy for p in points]
+
+
+def _accept_repartition(pcb_data, bus_groups, nets_plan):
+    """#622 part B 'accept': move ONLY the members whose round-1
+    REALIZED layer contradicts their river assignment. Measured basis
+    (K=30 microscope): 8 of 11 B-assigned members rode F for most of
+    their mid-run (SDQ4 6% B, SA3 4%) DESPITE the armed 5x off-layer
+    tax, and at 20x they either still refused (SA3 3%) or complied via
+    a 48mm detour and a lost net -- their assigned-layer path is
+    INFEASIBLE (river capacity: a rung-2 corridor holds ~5 lanes, the
+    river had 9 members), not underpriced. A defector legitimized onto
+    the layer it demonstrably used packs with that river instead of
+    freeloading as off-plan copper. Unlike the (measured-harmful)
+    partition mode this never touches a member whose realization AGREES
+    with its assignment. Rivers re-sort by comb principal order after
+    moves; a river never shrinks below 2 members."""
+    import os as _ar_os
+    # thresholds: a member moves only when its round-1 use of the
+    # ASSIGNED layer was near-zero and its use of the other layer
+    # decisive. Tight by default so a healthy round 1 no-ops (K=51
+    # measured: loose 0.4/0.6 moved 11 marginal members and cost +47
+    # vias -- the accepted layer saturates); K=30's catastrophic
+    # defectors sat at 0%, which tight thresholds still catch.
+    _lo = float(_ar_os.environ.get('KICAD_BUS_PLAN_ACCEPT_LO', '0.15'))
+    _hi = float(_ar_os.environ.get('KICAD_BUS_PLAN_ACCEPT_HI', '0.8'))
+    by_parent = {}
+    for bus in bus_groups:
+        if getattr(bus, 'river_layer', None):
+            par = bus.name.rsplit('_r', 1)[0] if '_r' in bus.name \
+                else bus.name
+            by_parent.setdefault(par, []).append(bus)
+    for par, rivers in by_parent.items():
+        if len(rivers) < 2:
+            continue
+        lay_to_river = {r.river_layer: r for r in rivers}
+        changed = set()
+
+        for r in rivers:
+            for k in reversed(range(len(r.net_ids))):
+                if len(r.net_ids) <= 2:
+                    break
+                nid = r.net_ids[k]
+                nm = (pcb_data.nets[nid].name
+                      if nid in pcb_data.nets else '')
+                lays = (nets_plan.get(nm) or {}).get('layers_mm') or {}
+                tot = sum(lays.values())
+                if tot <= 0:
+                    continue
+                fr_asn = lays.get(r.river_layer, 0.0) / tot
+                dom = max(lays, key=lays.get)
+                if fr_asn < _lo and lays[dom] / tot > _hi \
+                        and dom != r.river_layer \
+                        and dom in lay_to_river \
+                        and lay_to_river[dom] is not r:
+                    dest = lay_to_river[dom]
+                    dest.net_ids.append(nid)
+                    dest.source_positions.append(r.source_positions[k])
+                    dest.target_positions.append(r.target_positions[k])
+                    del r.net_ids[k]
+                    del r.source_positions[k]
+                    del r.target_positions[k]
+                    changed.update((id(r), id(dest)))
+                    print(f"  Bus plan (accept): {nm.split('/')[-1]} "
+                          f"{r.river_layer} river -> {dom} (rode "
+                          f"{r.river_layer} {fr_asn:.0%} in round 1)")
+        for r in rivers:
+            if id(r) not in changed or len(r.net_ids) < 2:
+                continue
+            combs = (r.target_positions
+                     if r.clique_endpoint == "target"
+                     else r.source_positions)
+            s = _principal_scalar(combs)
+            order = sorted(range(len(r.net_ids)), key=lambda i: s[i])
+            r.net_ids = [r.net_ids[i] for i in order]
+            r.source_positions = [r.source_positions[i] for i in order]
+            r.target_positions = [r.target_positions[i] for i in order]
+    return bus_groups
+
+
+def decorate_groups_from_plan(pcb_data, bus_groups, config):
+    """#622 part B, DECORATE mode (KICAD_BUS_PLAN_MODE=decorate): the
+    max-cut river split keeps choosing layers and membership; the plan
+    contributes only what the routed board actually knows better --
+    each river's member ORDER (realized lateral offsets) and its
+    CORRIDOR reference (the median member's realized path). Motivated
+    by measurement: partition mode's realized-layer pinning reproduced
+    the source board's layer noise (r2_51 failed 1 / 229 vias, r3_51
+    failed 4 / 245 vs the unplanned 0 / 202)."""
+    import os as _os
+    import json as _json
+    path = _os.environ.get('KICAD_BUS_PLAN_FILE')
+    if not path or not bus_groups or \
+            _os.environ.get('KICAD_BUS_PLAN_MODE',
+                            'decorate') != 'decorate':
+        return bus_groups
+    try:
+        with open(path, encoding='utf-8') as f:
+            nets_plan = _json.load(f).get('nets', {})
+    except (OSError, ValueError) as e:
+        print(f"  Bus plan: FAILED to read {path}: {e} -- ignored")
+        return bus_groups
+    # KICAD_BUS_PLAN_LEARN selects the ingredients: 'corridor'
+    # (default -- the one measured non-harmful channel: 0/207 vs
+    # the unplanned 0/202 at K=51) and 'accept' (acceptance
+    # repartition, see _accept_repartition), comma-combinable.
+    # A realized-ORDER channel was tried and REMOVED: realized
+    # order is LANDING order, but net_ids order is consumed as
+    # COMB order by the berth inversion costing, so pinning it
+    # mis-priced every inversion (measured 1 failed/240 vias
+    # alone, and the poison in every combined arm).
+    _learn = set((_os.environ.get('KICAD_BUS_PLAN_LEARN')
+                  or 'corridor').split(','))
+    if 'accept' in _learn:
+        bus_groups = _accept_repartition(pcb_data, bus_groups,
+                                         nets_plan)
+
+    def _plen(p):
+        return sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                   for a, b in zip(p, p[1:]))
+
+    for bus in bus_groups:
+        recs = {}
+        for nid in bus.net_ids:
+            nm = pcb_data.nets[nid].name if nid in pcb_data.nets else ''
+            if nm in nets_plan and nets_plan[nm].get('path'):
+                recs[nid] = nets_plan[nm]
+        if len(recs) < 2:
+            continue
+        # corridor member = length-median (offset-median and
+        # middle-half-shortest variants were tried and removed: neither
+        # ever beat length-median on a board)
+        med = sorted(recs, key=lambda nid: _plen(recs[nid]['path']))[
+            len(recs) // 2]
+        if 'corridor' in _learn:
+            # drop the leading BALL EDGE: the first path edge is the
+            # corridor member's private landing leg (ball -> tip, up
+            # to ~7mm of one member's diagonal); the corridor starts
+            # at the leg tip like the probe's stand-off trunk
+            _cp = recs[med]['path']
+            bus._plan_corridor_mm = _cp[1:] if len(_cp) > 2 else _cp
+        nm = [pcb_data.nets[nid].name.split('/')[-1]
+              for nid in bus.net_ids]
+        print(f"  Bus plan (decorate {'+'.join(sorted(_learn))}): "
+              f"{bus.name} order {' '.join(nm)}")
+    return bus_groups
 
 
 def split_groups_to_layer_rivers(pcb_data, bus_groups, config):
@@ -867,8 +1168,50 @@ def split_groups_to_layer_rivers(pcb_data, bus_groups, config):
                     n_cross += 1
         teeth = [net_teeth_common_layer(pcb_data, nid)
                  for nid in bus.net_ids]
+        # Terminal DIVE cost (#622 K=30 fix): per member and candidate
+        # layer, each terminal end whose attach-layer set excludes the
+        # layer needs one via to transition -- priced at 0.5 crossing
+        # units per end (2 vias == 1 crossing, the same equivalence the
+        # old teeth term used). This is what the teeth term was FOR,
+        # but net_teeth_common_layer reads None on dogbone fanouts
+        # (via-terminated stubs have no free tip), so the max-cut
+        # priced terminal reality at zero and assigned members to
+        # rivers they measurably refused (9-member B river, 8
+        # defectors at ~0% acceptance despite the armed 5x tax).
+        attach = [net_end_attach_layers(pcb_data, nid)
+                  for nid in bus.net_ids]
+
+        # KICAD_BUS_DIVE_SPLIT gates the dive-cost model (default OFF
+        # pending the corpus screen): ON prices terminal reality per
+        # end; OFF reproduces the legacy teeth-mismatch term exactly
+        # (which reads 0 on dogbone/stub-only fanouts -- the K=30
+        # blindness -- but is what the K=51 acceptance stack was tuned
+        # around: dive-split alone re-membered the rivers and measured
+        # 3 failed / 238 vias there vs the legacy 0/202).
+        _dive_on = _os.environ.get('KICAD_BUS_DIVE_SPLIT') \
+            not in (None, '', '0')
+
+        def _dive(i, layer):
+            if _dive_on:
+                return 0.5 * sum(1 for ends in attach[i]
+                                 if ends and layer not in ends)
+            return (1.0 if teeth[i] is not None and teeth[i] != layer
+                    else 0.0)
+
+        if _os.environ.get('KICAD_DBG_RIVER_SPLIT'):
+            for i, nid in enumerate(bus.net_ids):
+                nm = pcb_data.nets[nid].name.split('/')[-1]
+                print(f"    [split-dbg] {bus.name} {nm}: tooth "
+                      f"{teeth[i]} attach "
+                      f"{[sorted(e) for e in attach[i]]}")
         from collections import Counter as _C
         layer_votes = _C(t for t in teeth if t)
+        if _os.environ.get('KICAD_BUS_DIVE_SPLIT') not in (None, '',
+                                                           '0'):
+            for i in range(n):
+                for ends in attach[i]:
+                    if len(ends) == 1:  # a locked end votes its layer
+                        layer_votes[next(iter(ends))] += 1
         # A pour-covered layer cannot host a river: the plane-fragility
         # field overpowers any polite layer nudge and every member
         # defects (measured m2_51: 12/12 B-river members below 50%
@@ -906,17 +1249,15 @@ def split_groups_to_layer_rivers(pcb_data, bus_groups, config):
                        if cross[i][j] and side[i] == side[j])
             best = None
             for la, lb in ((cands[0], cands[1]), (cands[1], cands[0])):
-                mism = sum(1 for i in range(n)
-                           if teeth[i] is not None
-                           and teeth[i] != (la if side[i] == 0 else lb))
+                mism = sum(_dive(i, la if side[i] == 0 else lb)
+                           for i in range(n))
                 if best is None or mism < best[0]:
                     best = (mism, la, lb)
             return mono + best[0], best[1], best[2]
 
         # whole-group baseline: everyone one river on the majority layer
-        base_mism = min(
-            sum(1 for t in teeth if t is not None and t != l)
-            for l in cands)
+        base_mism = min(sum(_dive(i, l) for i in range(n))
+                        for l in cands)
         base_cost = n_cross + base_mism
         # init: landing-median split (the natural directional partition)
         med = sorted(land_s)[n // 2]
@@ -956,6 +1297,16 @@ def split_groups_to_layer_rivers(pcb_data, bus_groups, config):
                   f"({len(nm)}: {' '.join(nm)})")
         print(f"  Macro rivers: {bus.name} split cost {cur} vs whole "
               f"{base_cost} (crossing pairs {n_cross})")
+        # capacity ceiling disclosure (#622 fix 3): the corridor probe
+        # ladder caps at rung 3 = 7 lanes; a bigger river can never be
+        # served by one corridor at any rung
+        for _sv in (0, 1):
+            _cnt = side.count(_sv)
+            if _cnt > 7:
+                print(f"  Macro rivers: {bus.name} river of {_cnt} "
+                      f"exceeds the 7-lane corridor ceiling "
+                      f"(probe MAX_RUNG 3) -- capacity shortfall "
+                      f"by construction")
     return out
 
 
@@ -1133,7 +1484,7 @@ def refine_member_attraction(pcb_data, net_id, group, attraction_path,
     import os as _ra_os
     if attraction_path is None or group is None:
         return attraction_path, None
-    if not _ra_os.environ.get('KICAD_BUS_FOLLOW_LEADER'):
+    if _ra_os.environ.get('KICAD_BUS_FOLLOW_LEADER') in (None, '', '0'):
         return attraction_path, None
     nm = (pcb_data.nets[net_id].name if net_id in pcb_data.nets
           else str(net_id))

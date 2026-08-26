@@ -117,6 +117,77 @@ def plan_bus_corridors(pcb_data, config, bus_groups: List[BusGroup],
           f"room unit {room_mm:.3f}mm"
           f"{' [honest per-group maps]' if _honest else ''} ===")
     for g in bus_groups:
+        # #622 part B: a plan-defined river carries its LEARNED corridor
+        # (the median member's realized path from the routed board) --
+        # known-feasible geometry, so no probe: convert mm -> grid,
+        # trim the member-specific terminal teeth/legs off both ends,
+        # densify, done. Attraction stays soft downstream exactly as
+        # for a probed corridor.
+        _pc = getattr(g, '_plan_corridor_mm', None)
+        if _pc and len(_pc) >= 2:
+            import math as _m_pc
+            _gs = config.grid_step
+            _lays = list(config.layers or [])
+            # trim by the corridor's own ARC: the first/last 1.5mm are
+            # the median member's private terminal geometry (its leg /
+            # tooth), not the river. (Group source/target positions are
+            # NOT a usable reference here -- with exact legs armed they
+            # have already been rewritten to leg tips.)
+            _arc = [0.0]
+            for _a, _b in zip(_pc, _pc[1:]):
+                _arc.append(_arc[-1] + _m_pc.hypot(_b[0] - _a[0],
+                                                   _b[1] - _a[1]))
+            _TRIM = float(_hp_os.environ.get('KICAD_BUS_PLAN_CLIP',
+                                             '3.0'))
+
+            def _at_s(s):
+                for _i in range(len(_arc) - 1):
+                    if s <= _arc[_i + 1] + 1e-9:
+                        _sp = _arc[_i + 1] - _arc[_i]
+                        _t = 0.0 if _sp < 1e-12 else (s - _arc[_i]) / _sp
+                        return (_pc[_i][0]
+                                + _t * (_pc[_i + 1][0] - _pc[_i][0]),
+                                _pc[_i][1]
+                                + _t * (_pc[_i + 1][1] - _pc[_i][1]))
+                return (_pc[-1][0], _pc[-1][1])
+
+            if _arc[-1] > 2 * _TRIM + 0.5:
+                _s0, _s1 = _TRIM, _arc[-1] - _TRIM
+            else:
+                _s0, _s1 = 0.0, _arc[-1]
+            _clip = [_at_s(_s0) + (_pc[0][2],)]
+            for _p, _s in zip(_pc, _arc):
+                if _s0 < _s < _s1:
+                    _clip.append(_p)
+            _clip.append(_at_s(_s1) + (_pc[-1][2],))
+            _pc, _lo, _hi = _clip, 0, len(_clip)
+            # FLATTEN to one layer + SMOOTH: the median member's raw
+            # path carries its own layer hops and lane jitter -- fed
+            # raw as the guide, one member's round-1 excursions attract
+            # the whole river (measured r4_51: +41 vias over baseline).
+            # The corridor rides the river's layer, and the realized
+            # centerline is RDP'd octilinear like every other guide.
+            _lay_nm = getattr(g, 'river_layer', None)
+            if _lay_nm not in _lays:
+                from collections import Counter as _Ct
+                _lay_nm = _Ct(p[2] for p in _pc).most_common(1)[0][0]
+            _li = _lays.index(_lay_nm) if _lay_nm in _lays else 0
+            _gp = []
+            for x, y, _ln in _pc[_lo:_hi]:
+                q = (int(round(x / _gs)), int(round(y / _gs)), _li)
+                if not _gp or q != _gp[-1]:
+                    _gp.append(q)
+            if len(_gp) >= 2:
+                from bus_detection import (smooth_realized_path,
+                                           prepare_ribbon_plan)
+                corridors[g.name] = smooth_realized_path(_gp)
+                print(f"  {g.name}: corridor from PLAN "
+                      f"({len(_gp)} pts -> {_lay_nm}, "
+                      f"{_arc[-1] - _s1 + _s0:.1f}mm terminal arc "
+                      f"clipped)")
+                prepare_ribbon_plan(pcb_data, config, g,
+                                    corridors[g.name])
+                continue
         if _honest:
             probe_map = build_base_obstacle_map(
                 pcb_data, config, list(g.net_ids),
@@ -185,55 +256,60 @@ def plan_bus_corridors(pcb_data, config, bus_groups: List[BusGroup],
                 if _ps is not None and _pt is not None:
                     _ovr_src = [_row(*_ps)]
                     _ovr_tgt = [_row(*_pt)]
-        for k in range(k_max, -1, -1):
-            # Probe via the wide-power mechanism: a track k sibling-rooms
-            # wider per side keeps that much margin from every obstacle on
-            # the shared map. Neck-down is disabled so the rung fails
-            # honestly instead of silently degrading to rung 0.
-            # LAMINAR probe: the corridor centerline is the reference every
-            # member is attracted to -- if the probe itself wanders layers,
-            # "same-layer attraction" chases a different layer every span
-            # and no river can form (observed: SDC0's corridor spanned all
-            # four layers at the old 4x). The probe pays a much stiffer
-            # layer-change price than member routing, so the skeleton stays
-            # on one layer unless a change is genuinely unavoidable.
-            via_mult = env_knobs.BUS_CORRIDOR_PROBE_VIA_MULT
-            cfg_k = replace(
-                config, power_tap_neckdown=False,
-                via_cost=int(round(config.via_cost * via_mult)),
-                power_net_widths={**config.power_net_widths,
-                                  rep: config.track_width + 2 * k * room_mm})
-            # #622 macro rivers: a river group's corridor must be probed
-            # ON its assigned layer -- at the laminar 20x via price the
-            # probe pins to the representative's TOOTH layer and the
-            # whole river then follows a wrong-layer skeleton (measured
-            # m8_8: B river, corridor layers [0]). River groups probe at
-            # the NORMAL via price (on-ramp dives are the human's
-            # dive-river-dive; mid-path wander is suppressed by the 5x
-            # off-river-layer cost instead, and the demotion counter
-            # already forgives ramp changes within 3mm of the ends).
-            if getattr(g, 'river_layer', None):
-                from bus_detection import bus_river_layer_config
-                cfg_k = bus_river_layer_config(
-                    replace(cfg_k, via_cost=config.via_cost),
-                    config, g, mult=5.0)
-            result = route_net_with_obstacles(
-                pcb_data, rep, cfg_k, probe_map,
-                reverse_direction=(g.clique_endpoint == "target"),
-                sources_override=_ovr_src, targets_override=_ovr_tgt)
-            if not result or result.get('failed') or not result.get('path'):
+        def _run_ladder(_pm):
+            best = None
+            for k in range(k_max, -1, -1):
+                # Probe via the wide-power mechanism: a track k sibling-rooms
+                # wider per side keeps that much margin from every obstacle on
+                # the shared map. Neck-down is disabled so the rung fails
+                # honestly instead of silently degrading to rung 0.
+                # LAMINAR probe: the corridor centerline is the reference every
+                # member is attracted to -- if the probe itself wanders layers,
+                # "same-layer attraction" chases a different layer every span
+                # and no river can form (observed: SDC0's corridor spanned all
+                # four layers at the old 4x). The probe pays a much stiffer
+                # layer-change price than member routing, so the skeleton stays
+                # on one layer unless a change is genuinely unavoidable.
+                via_mult = env_knobs.BUS_CORRIDOR_PROBE_VIA_MULT
+                cfg_k = replace(
+                    config, power_tap_neckdown=False,
+                    via_cost=int(round(config.via_cost * via_mult)),
+                    power_net_widths={**config.power_net_widths,
+                                      rep: config.track_width + 2 * k * room_mm})
+                # #622 macro rivers: a river group's corridor must be probed
+                # ON its assigned layer -- at the laminar 20x via price the
+                # probe pins to the representative's TOOTH layer and the
+                # whole river then follows a wrong-layer skeleton (measured
+                # m8_8: B river, corridor layers [0]). River groups probe at
+                # the NORMAL via price (on-ramp dives are the human's
+                # dive-river-dive; mid-path wander is suppressed by the 5x
+                # off-river-layer cost instead, and the demotion counter
+                # already forgives ramp changes within 3mm of the ends).
+                if getattr(g, 'river_layer', None):
+                    from bus_detection import bus_river_layer_config
+                    cfg_k = bus_river_layer_config(
+                        replace(cfg_k, via_cost=config.via_cost),
+                        config, g, mult=5.0)
+                result = route_net_with_obstacles(
+                    pcb_data, rep, cfg_k, _pm,
+                    reverse_direction=(g.clique_endpoint == "target"),
+                    sources_override=_ovr_src, targets_override=_ovr_tgt)
+                if not result or result.get('failed') or not result.get('path'):
+                    if verbose:
+                        print(f"  {g.name}: rung {k} (+{k * room_mm:.2f}mm "
+                              f"clearance) no route")
+                    continue
+                length = calculate_route_length(
+                    result['new_segments'], result.get('new_vias', []), pcb_data)
+                score = length + (k_max - k) * room_mm * ROOM_WEIGHT
                 if verbose:
-                    print(f"  {g.name}: rung {k} (+{k * room_mm:.2f}mm "
-                          f"clearance) no route")
-                continue
-            length = calculate_route_length(
-                result['new_segments'], result.get('new_vias', []), pcb_data)
-            score = length + (k_max - k) * room_mm * ROOM_WEIGHT
-            if verbose:
-                print(f"  {g.name}: rung {k} routes, length {length:.1f}mm, "
-                      f"score {score:.1f}")
-            if best is None or score < best[0]:
-                best = (score, k, length, result)
+                    print(f"  {g.name}: rung {k} routes, length {length:.1f}mm, "
+                          f"score {score:.1f}")
+                if best is None or score < best[0]:
+                    best = (score, k, length, result)
+            return best
+
+        best = _run_ladder(probe_map)
         if best is None:
             print(f"  {g.name}: no corridor at any rung -- falling back to "
                   f"neighbor attraction")
@@ -275,4 +351,18 @@ def plan_bus_corridors(pcb_data, config, bus_groups: List[BusGroup],
               f"(room for {k} sibling(s)/side), {length:.1f}mm, "
               f"{_changes} layer change(s), layers {lay}, "
               f"{len(corridors[g.name])} pts")
+        # #622 realism fix 3: DISCLOSE capacity shortfall. The winning
+        # rung's own arithmetic bounds the corridor at 2k+1 lanes; a
+        # river with more members CANNOT pack it (measured K=30: a
+        # 9-member river on a rung-2 corridor -> 0.15 mean acceptance,
+        # 8 defectors). Disclosure, not rejection: members still route
+        # softly, but the shortfall is data instead of a mystery.
+        _lanes = 2 * k + 1
+        if len(g.net_ids) > _lanes:
+            print(f"  {g.name}: CAPACITY SHORTFALL -- {len(g.net_ids)} "
+                  f"members > {_lanes} lane(s) at rung {k}; expect "
+                  f"defection/excursions for ~"
+                  f"{len(g.net_ids) - _lanes} member(s)")
+        from bus_detection import prepare_ribbon_plan
+        prepare_ribbon_plan(pcb_data, config, g, corridors[g.name])
     return corridors, demoted
