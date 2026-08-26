@@ -1490,29 +1490,35 @@ def _retry_victim_main_with_ripup(
                 ripped_route_layer_costs=state.ripped_route_layer_costs,
                 ripped_route_via_positions=state.ripped_route_via_positions)
 
-        # A bus-member victim re-routes with its corridor (no routed-paths
-        # dict tracked at Phase-3 depth; the planned corridor is the stable
-        # artifact and the usual hit).
-        from bus_detection import bus_attraction_context
+        # A bus-member victim re-routes with the FULL bus stack (#622):
+        # realized sibling paths, leg re-emission, river dose, and the
+        # terminal-plan lane refinement -- corridor-only attraction here
+        # aimed victims at the raw centerline their siblings occupy.
+        from bus_detection import (bus_attraction_context,
+                                   prepare_victim_bus_context,
+                                   retract_victim_leg)
         _attr, _rev = bus_attraction_context(
             victim_id, getattr(state, 'bus_net_to_group', None),
-            getattr(state, 'bus_corridors', None))
+            getattr(state, 'bus_corridors', None), routed_net_paths)
         if _attr is None:
             # #656: phase-3 victim reroutes keep their PLAN lane too --
             # churn on contested nets is where adherence erodes (#655).
             from global_plan import plan_attraction_path
             _attr = plan_attraction_path(config, victim_id, pcb_data)
             _rev = False
+        (_cfg_p3v, _attr, _leg_segs_p3v, _bg_p3v,
+         _ball_p3v) = prepare_victim_bus_context(
+            pcb_data, state, victim_id, config, _attr, routed_net_paths)
         if was_multipoint:
             multipoint_pads = get_multipoint_net_pads(pcb_data, victim_id, config)
             if multipoint_pads:
-                result = route_multipoint_main(pcb_data, victim_id, config, obstacles, multipoint_pads,
+                result = route_multipoint_main(pcb_data, victim_id, _cfg_p3v, obstacles, multipoint_pads,
                                                attraction_path=_attr, state=state)
             else:
-                result = route_net_with_obstacles(pcb_data, victim_id, config, obstacles,
+                result = route_net_with_obstacles(pcb_data, victim_id, _cfg_p3v, obstacles,
                                                   attraction_path=_attr, reverse_direction=_rev)
         else:
-            result = route_net_with_obstacles(pcb_data, victim_id, config, obstacles,
+            result = route_net_with_obstacles(pcb_data, victim_id, _cfg_p3v, obstacles,
                                               attraction_path=_attr, reverse_direction=_rev)
 
         if result and not result.get('failed') \
@@ -1521,7 +1527,18 @@ def _retry_victim_main_with_ripup(
             # but the net's island copper sources its Phase-3 taps. Reading
             # it as failure burned further rip-up rounds for nothing.
             print(f"    {victim_name}: main re-route rip-up SUCCESS (N={N})")
+            # #622: the re-emitted leg rides the victim's RESULT (sync
+            # strips unclaimed mid-run copper -- the f4_2 lesson).
+            if _leg_segs_p3v:
+                result['new_segments'] = (list(result.get('new_segments')
+                                               or [])
+                                          + list(_leg_segs_p3v))
+                _leg_segs_p3v = None
             return result, nested_ripped
+        if _leg_segs_p3v:
+            retract_victim_leg(pcb_data, _bg_p3v, victim_id,
+                               _leg_segs_p3v, _ball_p3v)
+            _leg_segs_p3v = None
         last_blocked = list(dict.fromkeys(
             (result or {}).get('blocked_cells_forward', [])
             + (result or {}).get('blocked_cells_backward', [])))
@@ -1598,23 +1615,32 @@ def _reroute_phase3_ripped_nets(
         # Check if this was originally a multi-point net (from saved_result)
         was_multipoint = saved_result and saved_result.get('mst_edges') and len(saved_result.get('mst_edges', [])) > 1
 
-        # Ripped bus members reroute with their corridor here too
-        from bus_detection import bus_attraction_context
+        # Ripped bus members reroute with the FULL bus stack (#622):
+        # realized sibling paths, leg re-emission, river dose, and the
+        # terminal-plan lane refinement (shared prepare -- see
+        # prepare_victim_bus_context for the measured rationale).
+        from bus_detection import (bus_attraction_context,
+                                   prepare_victim_bus_context,
+                                   retract_victim_leg)
         _attr, _rev = bus_attraction_context(
             ripped_net_id, getattr(state, 'bus_net_to_group', None),
-            getattr(state, 'bus_corridors', None))
+            getattr(state, 'bus_corridors', None), routed_net_paths)
+        (_cfg_p3r, _attr, _leg_segs_p3r, _bg_p3r,
+         _ball_p3r) = prepare_victim_bus_context(
+            pcb_data, state, ripped_net_id, config, _attr,
+            routed_net_paths)
         if was_multipoint:
             # Use multipoint routing for multi-point nets
             multipoint_pads = get_multipoint_net_pads(pcb_data, ripped_net_id, config)
             if multipoint_pads:
-                result = route_multipoint_main(pcb_data, ripped_net_id, config, obstacles, multipoint_pads,
+                result = route_multipoint_main(pcb_data, ripped_net_id, _cfg_p3r, obstacles, multipoint_pads,
                                                attraction_path=_attr, state=state)
             else:
-                result = route_net_with_obstacles(pcb_data, ripped_net_id, config, obstacles,
+                result = route_net_with_obstacles(pcb_data, ripped_net_id, _cfg_p3r, obstacles,
                                                   attraction_path=_attr, reverse_direction=_rev)
         else:
             # Route the main path for simple nets
-            result = route_net_with_obstacles(pcb_data, ripped_net_id, config, obstacles,
+            result = route_net_with_obstacles(pcb_data, ripped_net_id, _cfg_p3r, obstacles,
                                               attraction_path=_attr, reverse_direction=_rev)
 
         # A victim whose main re-route fails BARE strands, and the #85
@@ -1651,6 +1677,13 @@ def _reroute_phase3_ripped_nets(
         elif result and not result.get('failed') and result.get('path'):
             main_vias = result.get('new_vias', [])
             add_route_to_pcb_data(pcb_data, result, debug_lines=config.debug_lines)
+            # #622: the re-emitted leg rides the victim's RESULT before
+            # the commit registers it (sync-strip lesson).
+            if _leg_segs_p3r:
+                result['new_segments'] = (list(result.get('new_segments')
+                                               or [])
+                                          + list(_leg_segs_p3r))
+                _leg_segs_p3r = None
             _commit_net_result(results, routed_results, ripped_net_id, result,
                                pcb_data, config)
             routed_net_ids.append(ripped_net_id)
@@ -1794,6 +1827,12 @@ def _reroute_phase3_ripped_nets(
                 "reason": "no path found during Phase 3 re-route"
             })
             print(f"    {RED}Failed to re-route{RESET}")
+            # #622: free the re-emitted landing leg -- the victim shipped
+            # no route, so the leg is copper for nothing.
+            if _leg_segs_p3r:
+                retract_victim_leg(pcb_data, _bg_p3r, ripped_net_id,
+                                   _leg_segs_p3r, _ball_p3r)
+                _leg_segs_p3r = None
             # CRITICAL: Remove from pending_multipoint_nets when re-route fails
             # If we don't remove it, Phase 3 will later process this net and start with
             # the OLD stale segments from the pending result (which were ripped and are

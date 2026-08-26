@@ -175,51 +175,15 @@ def run_reroute_loop(
             # dive-at-the-ball loose net; the stick and river-layer
             # economics were likewise main-loop-only (measured: 38-74
             # rips at K=51 = most of the bus re-routed degraded).
-            _cfg_rr622 = config
-            _leg_segs_rr622 = None
-            _bg_rr622 = (getattr(state, 'bus_net_to_group', None)
-                         or {}).get(ripped_net_id)
-            if _bg_rr622 is not None:
-                from bus_terminal import ensure_landing_leg
-                from bus_detection import bus_river_layer_config
-                _el_rr = ensure_landing_leg(pcb_data, _bg_rr622,
-                                            ripped_net_id, config)
-                if _el_rr is not None:
-                    _leg_segs_rr622 = _el_rr[1]
-                    print(f"  Landing leg re-emitted for ripped member "
-                          f"(tip {_el_rr[0][0]:.2f},{_el_rr[0][1]:.2f})")
-                # Victims re-enter with the leg and the river layer
-                # economy but NO stick: stick+5x together amplified the
-                # cascade (n2_51: 74 -> 111 rips, vias up); 5x alone,
-                # decomposed on the pour-free bench, is the completion
-                # arm -- 0 failed and paid crossings 125 (below the
-                # human's 126 on the same nets) vs the gentle 2x's 218
-                # vias / 3 stranded / paid 184. Discipline through the
-                # rip path is what holds the rivers; the gentle dose
-                # let 86 re-entrants defect and diluted the split.
-                # KICAD_BUS_VICTIM_RIVER_MULT overrides for dose A/Bs.
-                import os as _rr_os622
-                _cfg_rr622 = bus_river_layer_config(
-                    config, config, _bg_rr622,
-                    mult=float(_rr_os622.environ.get(
-                        'KICAD_BUS_VICTIM_RIVER_MULT', '5.0')))
-                # Reroutes FOLLOW THE PLAN: the same terminal refinement
-                # the main loop applies (lane target from the leader's
-                # realized path / gap leg from the corridor) -- without
-                # it a victim re-aims at the raw centerline its routed
-                # siblings occupy and rips them back (85 of 111 rips
-                # originated here, p3_51).
-                from bus_detection import refine_member_attraction
-                _attr, _wps_rr622 = refine_member_attraction(
-                    pcb_data, ripped_net_id, _bg_rr622, _attr,
-                    getattr(state, 'bus_corridors', None),
-                    routed_net_paths, config)
-                if _wps_rr622:
-                    from dataclasses import replace as _rep_rr622
-                    _cfg_rr622 = _rep_rr622(
-                        _cfg_rr622,
-                        corridor_waypoints=list(_wps_rr622),
-                        bus_leg_waypoints=True)
+            # Full victim bus stack (leg re-emission + victim river
+            # dose + terminal-plan refinement) -- shared with both
+            # Phase-3 victim sites via prepare_victim_bus_context; the
+            # measured rationale lives on that function.
+            from bus_detection import prepare_victim_bus_context
+            (_cfg_rr622, _attr, _leg_segs_rr622, _bg_rr622,
+             _ball_rr622) = prepare_victim_bus_context(
+                pcb_data, state, ripped_net_id, config, _attr,
+                routed_net_paths)
             # #572: a ripped forced-link net re-routes its EXACT oracle links
             # -- derived endpoints are model-blind to the exact-fill gap, so
             # a plain reroute here would reconnect arbitrary fragments and
@@ -671,15 +635,10 @@ def run_reroute_loop(
                     # carries its own leg), and any leftover new leg would
                     # ship as a duplicate spur beside it.
                     if _leg_segs_rr622:
-                        from bus_terminal import remove_landing_leg
-                        _n_rm = remove_landing_leg(pcb_data, _leg_segs_rr622)
-                        if _bg_rr622 is not None and _el_rr is not None \
-                                and ripped_net_id in _bg_rr622.net_ids:
-                            _bg_rr622.target_positions[
-                                _bg_rr622.net_ids.index(ripped_net_id)] = \
-                                _el_rr[2]
-                        print(f"  Landing leg retracted: {_n_rm} seg(s) "
-                              f"freed after terminal reroute failure")
+                        from bus_detection import retract_victim_leg
+                        retract_victim_leg(pcb_data, _bg_rr622,
+                                           ripped_net_id,
+                                           _leg_segs_rr622, _ball_rr622)
                         _leg_segs_rr622 = None
                     # #468: a terminally-failed rip victim must not ship with
                     # LESS copper than it started with. Conflict-free saved

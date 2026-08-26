@@ -989,6 +989,61 @@ def bus_river_layer_config(cfg_route, config, group, mult=2.0):
     return _rep(cfg_route, layer_costs=shaped)
 
 
+def prepare_victim_bus_context(pcb_data, state, net_id, config,
+                               attraction_path, routed_paths):
+    """Full bus stack for a rip victim's reroute -- ONE copy shared by
+    the reroute loop and both Phase-3 victim sites: landing-leg
+    re-emission (the leg was ripped WITH the result), river layer
+    economics at the victim dose (KICAD_BUS_VICTIM_RIVER_MULT, default
+    5.0 -- the measured completion arm; no stick, that cascaded), and
+    the same terminal-plan refinement the main loop applies (lane
+    target / gap leg + waypoints). Returns
+    (cfg, attraction_path, leg_segs, group, ball_xy). Non-members pass
+    through untouched. Callers must merge leg_segs into the victim's
+    RESULT on success (the sync strips unclaimed mid-run copper) and
+    retract + re-point the group target at ball_xy on terminal
+    failure."""
+    group = (getattr(state, 'bus_net_to_group', None) or {}).get(net_id)
+    if group is None:
+        return config, attraction_path, None, None, None
+    from bus_terminal import ensure_landing_leg
+    leg_segs = ball = None
+    el = ensure_landing_leg(pcb_data, group, net_id, config)
+    if el is not None:
+        tip, leg_segs, ball = el
+        print(f"  Landing leg re-emitted for ripped member "
+              f"(tip {tip[0]:.2f},{tip[1]:.2f})")
+    import os as _pv_os
+    cfg = bus_river_layer_config(
+        config, config, group,
+        mult=float(_pv_os.environ.get('KICAD_BUS_VICTIM_RIVER_MULT',
+                                      '5.0')))
+    attraction_path, wps = refine_member_attraction(
+        pcb_data, net_id, group, attraction_path,
+        getattr(state, 'bus_corridors', None), routed_paths, config)
+    if wps:
+        from dataclasses import replace as _pv_rep
+        cfg = _pv_rep(cfg, corridor_waypoints=list(wps),
+                      bus_leg_waypoints=True)
+    return cfg, attraction_path, leg_segs, group, ball
+
+
+def retract_victim_leg(pcb_data, group, net_id, leg_segs, ball_xy):
+    """Terminal-failure counterpart of prepare_victim_bus_context: free
+    the re-emitted leg and re-point the group target at the BALL so the
+    next attempt re-derives from scratch (a restore re-adds the PRE-rip
+    result, which carries its own leg)."""
+    if not leg_segs:
+        return
+    from bus_terminal import remove_landing_leg
+    n_rm = remove_landing_leg(pcb_data, leg_segs)
+    if group is not None and ball_xy is not None \
+            and net_id in group.net_ids:
+        group.target_positions[group.net_ids.index(net_id)] = ball_xy
+    print(f"  Landing leg retracted: {n_rm} seg(s) freed after "
+          f"terminal reroute failure")
+
+
 def refine_member_attraction(pcb_data, net_id, group, attraction_path,
                              bus_corridors, routed_paths, config):
     """FOLLOW_LEADER terminal refinement, ONE copy shared by the main
