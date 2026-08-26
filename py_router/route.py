@@ -2721,11 +2721,18 @@ def batch_route(input_file: str, output_file: str, net_names: List[str],
     # cleanup/smoothing pipeline. Opt-in; berth legs/teeth are original
     # or result copper and survive by the pass's own boundaries.
     import os as _sn_os622
-    if _sn_os622.environ.get('KICAD_BUS_SNAP') \
-            and not (_ckpt_stop and not _ckpt_cleanup):
+    if not (_ckpt_stop and not _ckpt_cleanup):
         _bus_ids622 = sorted(getattr(state, 'bus_net_to_group', None)
                              or {})
-        if _bus_ids622:
+        # #622 via-excursion collapse (KICAD_VIA_COLLAPSE=1): kill short
+        # dive-and-return via pairs first, then let the snap straighten
+        # the collapsed spans.
+        _vc622 = _sn_os622.environ.get('KICAD_VIA_COLLAPSE', '')
+        if _vc622 and _bus_ids622:
+            from pcb_modification import collapse_via_excursions
+            collapse_via_excursions(results, pcb_data, _bus_ids622,
+                                    config)
+        if _sn_os622.environ.get('KICAD_BUS_SNAP') and _bus_ids622:
             from pcb_modification import snap_bus_chains
             snap_bus_chains(results, pcb_data, _bus_ids622, config)
     _cleanup = None if (_ckpt_stop and not _ckpt_cleanup) else run_post_route_cleanup(

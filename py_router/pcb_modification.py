@@ -3843,6 +3843,170 @@ def _seg_cross_point(ax, ay, bx, by, cx, cy, dx, dy):
     return (ax + t * rx, ay + t * ry)
 
 
+def _collapse_one_net(pcb_data, nid, owned_seg, owned_via, config,
+                      max_span_mm, stats):
+    """One collapse attempt for one net; returns True when it changed
+    the board (caller re-scans). See collapse_via_excursions."""
+    from bus_terminal import _leg_clear, _leg_offenders
+    from collections import defaultdict
+    vk = lambda x, y: (round(x, 3), round(y, 3))
+    segs = [sg for sg in pcb_data.segments if sg.net_id == nid]
+    vias = [v for v in pcb_data.vias
+            if v.net_id == nid and id(v) in owned_via]
+    if len(vias) < 2:
+        return False
+    by_pt = defaultdict(list)          # (pt, layer) -> segs
+    for sg in segs:
+        by_pt[(vk(sg.start_x, sg.start_y), sg.layer)].append(sg)
+        by_pt[(vk(sg.end_x, sg.end_y), sg.layer)].append(sg)
+    via_at = {vk(v.x, v.y): v for v in vias}
+    for va in vias:
+        a = vk(va.x, va.y)
+        lays = {lay for (pt, lay) in by_pt if pt == a}
+        if len(lays) != 2:
+            continue
+        for L in lays:
+            if len(by_pt[(a, L)]) != 1:
+                continue
+            # walk the excursion chain on L from va
+            chain = []
+            cur_seg = by_pt[(a, L)][0]
+            cur = a
+            ok = True
+            end_pt = None
+            while True:
+                chain.append(cur_seg)
+                nxt = (vk(cur_seg.end_x, cur_seg.end_y)
+                       if vk(cur_seg.start_x, cur_seg.start_y) == cur
+                       else vk(cur_seg.start_x, cur_seg.start_y))
+                if nxt in via_at and nxt != a:
+                    end_pt = nxt
+                    break
+                cont = [t for t in by_pt[(nxt, L)] if t is not cur_seg]
+                if len(cont) != 1:
+                    ok = False
+                    break
+                cur_seg = cont[0]
+                cur = nxt
+            if not ok or end_pt is None:
+                continue
+            vb = via_at[end_pt]
+            span = math.hypot(vb.x - va.x, vb.y - va.y)
+            if span > max_span_mm or span < 1e-6:
+                continue
+            b_lays = {lay for (pt, lay) in by_pt if pt == end_pt}
+            outer_a = lays - {L}
+            outer_b = b_lays - {L}
+            if len(outer_a) != 1 or outer_a != outer_b:
+                continue
+            outer = next(iter(outer_a))
+            if not all(id(t) in owned_seg for t in chain):
+                continue
+            stats['pairs'] += 1
+            x1, y1 = a
+            x2, y2 = end_pt
+            dx, dy = x2 - x1, y2 - y1
+            d = min(abs(dx), abs(dy))
+            pts = [(x1, y1)]
+            mid = (x1 + d * (1 if dx > 0 else -1 if dx < 0 else 0),
+                   y1 + d * (1 if dy > 0 else -1 if dy < 0 else 0))
+            if mid != (x1, y1) and mid != (x2, y2):
+                pts.append(mid)
+            pts.append((x2, y2))
+            width = max(t.width for t in chain)
+            clear = _leg_clear(pcb_data, pts, outer, width,
+                               config.clearance, nid)
+            if not clear:
+                stats['declined'] += 1
+                continue
+            # commit: drop chain + both vias, lay the dogleg
+            cids = {id(t) for t in chain}
+            pcb_data.segments[:] = [t for t in pcb_data.segments
+                                    if id(t) not in cids]
+            pcb_data.vias[:] = [v for v in pcb_data.vias
+                                if v is not va and v is not vb]
+            for t in chain:
+                r = owned_seg[id(t)]
+                r['new_segments'] = [u for u in r['new_segments']
+                                     if u is not t]
+            for v in (va, vb):
+                r = owned_via.get(id(v))
+                if r is not None:
+                    r['new_vias'] = [u for u in r.get('new_vias', [])
+                                     if u is not v]
+            host = owned_seg[id(chain[0])]
+            new_segs = []
+            for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+                ns = Segment(start_x=ax, start_y=ay, end_x=bx, end_y=by,
+                             width=width, layer=outer, net_id=nid)
+                new_segs.append(ns)
+                pcb_data.segments.append(ns)
+                owned_seg[id(ns)] = host
+            host['new_segments'] = (list(host['new_segments'])
+                                    + new_segs)
+            stats['collapsed'] += 1
+            return True
+    return False
+
+
+def collapse_via_excursions(results, pcb_data: PCBData, net_ids, config,
+                            max_span_mm: float = 4.0):
+    """#622 via-excursion collapse (KICAD_VIA_COLLAPSE): walk each net's
+    routed copper for short DIVE-AND-RETURN excursions -- a via pair
+    bracketing an off-layer chain -- and re-lay the span on the OUTER
+    layer as a direct octilinear dogleg, killing both vias. The dogleg
+    must pass the exact crossing-aware check; a blocked dogleg declines
+    (measured on the K=51 bench: the surviving excursions are almost all
+    STRUCTURAL -- the corridor is crossed by another track or walled by
+    pads, which is exactly why the router paid 2 vias there. A cascade
+    shove that translated blocking sibling windows aside converted ZERO
+    of them at every K tried; that machinery lives on the
+    bus622-cascade-shove branch with its census).
+
+    Ordering is INSIDE-OUT (user design): shortest routes first (inner
+    rings of a wrap are shortest), so consolidating the inside frees
+    space for the next ring; sweeps repeat to a FIXPOINT (a collapse
+    enables the neighbor's collapse), capped at 10.
+
+    Measured yield (K=51 bench): 15 excursions -> -30 vias (232->202),
+    -6/-10/-12 at K=15/25/35, no failure/DRC cost. Endpoints are via
+    footpoints, preserved exactly -- connectivity by construction; swaps
+    ride pcb_data AND the owning results (sync law). Runs before
+    snap_bus_chains so the snap straightens collapsed spans."""
+    stats = {'pairs': 0, 'collapsed': 0, 'declined': 0, 'sweeps': 0}
+    owned_seg = {}
+    owned_via = {}
+    for r in results:
+        for sg in (r.get('new_segments') or []):
+            owned_seg[id(sg)] = r
+        for v in (r.get('new_vias') or []):
+            owned_via[id(v)] = r
+
+    def _net_len(nid):
+        return sum(math.hypot(sg.end_x - sg.start_x,
+                              sg.end_y - sg.start_y)
+                   for sg in pcb_data.segments if sg.net_id == nid)
+
+    for _sweep in range(10):
+        stats['sweeps'] = _sweep + 1
+        stats['pairs'] = 0
+        stats['declined'] = 0
+        sweep_changed = False
+        ordered = sorted(net_ids, key=_net_len)
+        for nid in ordered:
+            while _collapse_one_net(pcb_data, nid, owned_seg, owned_via,
+                                    config, max_span_mm, stats):
+                sweep_changed = True
+        if not sweep_changed:
+            break
+    if stats['pairs'] or stats['collapsed']:
+        print(f"  Via collapse: {stats['collapsed']} excursion(s) "
+              f"collapsed ({stats['collapsed'] * 2} vias freed), "
+              f"{stats['declined']} declined, {stats['sweeps']} "
+              f"sweep(s)")
+    return stats
+
+
 def snap_bus_chains(results, pcb_data: PCBData, bus_net_ids, config,
                     eps_ladder=(0.25, 0.12, 0.06)):
     """#622 ribbon-v3 snap, take-2 form (KICAD_BUS_SNAP=1): replace each

@@ -96,6 +96,54 @@ def _leg_clear(pcb_data: PCBData, pts: List[Tuple[float, float]],
     return True
 
 
+def _leg_offenders(pcb_data: PCBData, pts: List[Tuple[float, float]],
+                   layer: str, width: float, clearance: float,
+                   net_id: int) -> list:
+    """The objects behind a _leg_clear refusal: every foreign pad,
+    same-layer segment, and via within clearance of the polyline, as
+    ('pad'|'segment'|'via', obj) pairs. Same geometry as _leg_clear
+    (crossing-aware); used by the cooperative shove to decide whether
+    the wall is a movable sibling or immovable copper."""
+    hw = width / 2.0
+    out = []
+    seen = set()
+
+    def _hit(kind, obj):
+        if id(obj) not in seen:
+            seen.add(id(obj))
+            out.append((kind, obj))
+
+    for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+        for fp in pcb_data.footprints.values():
+            for p in fp.pads:
+                if p.net_id == net_id:
+                    continue
+                if getattr(p, 'drill', 0):
+                    r = max(p.size_x, p.size_y) / 2.0
+                elif layer in p.layers:
+                    r = (p.size_x / 2.0 if p.shape == 'circle'
+                         else math.hypot(p.size_x, p.size_y) / 2.0)
+                else:
+                    continue
+                if _pt_seg_d(p.global_x, p.global_y, x1, y1, x2, y2) \
+                        < r + hw + clearance - 1e-6:
+                    _hit('pad', p)
+        for s in pcb_data.segments:
+            if s.net_id == net_id or s.layer != layer:
+                continue
+            if _seg_seg_d(x1, y1, x2, y2, s.start_x, s.start_y,
+                          s.end_x, s.end_y) \
+                    < s.width / 2.0 + hw + clearance - 1e-6:
+                _hit('segment', s)
+        for v in pcb_data.vias:
+            if v.net_id == net_id:
+                continue
+            if _pt_seg_d(v.x, v.y, x1, y1, x2, y2) \
+                    < v.size / 2.0 + hw + clearance - 1e-6:
+                _hit('via', v)
+    return out
+
+
 def remove_landing_leg(pcb_data: PCBData, leg_segs: List[Segment]) -> int:
     """Retract an emitted landing leg after its member terminally failed
     to route: the leg is copper for a route that never arrived -- left in

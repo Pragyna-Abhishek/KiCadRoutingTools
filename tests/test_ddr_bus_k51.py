@@ -42,6 +42,9 @@ ENV = {
     'KICAD_ATTRACT_POTENTIAL': '10000', 'KICAD_ATTRACT_BASIN_PCT': '50',
     'KICAD_BUS_MACRO_RIVERS': '1', 'KICAD_BUS_EXIT_EXT': '0.8',
     'KICAD_BUS_SNAP': '1', 'KICAD_DBG_CROSS_CANARY': '1',
+    # via-excursion collapse: measured -30 vias at K=51 with no
+    # failure/DRC cost (dive-and-return via pairs re-laid as doglegs)
+    'KICAD_VIA_COLLAPSE': '1',
 }
 VIA_BAND = 280
 
