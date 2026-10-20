@@ -17,6 +17,7 @@ from routing_config import GridRouteConfig, GridCoord
 from geometry_utils import UnionFind
 from bresenham_utils import walk_line
 from obstacle_map import add_board_edge_obstacles
+from routing_utils import iter_pad_blocked_cells, pad_rotation_residual
 from plane_obstacle_builder import (
     _precompute_circle_offsets, _bresenham_centers,
     _batch_block_circles_via, _batch_block_circles_cell
@@ -529,6 +530,14 @@ def _block_pad_cells(
     clearance: float
 ):
     """Block grid cells for a pad with clearance."""
+    rotation = pad_rotation_residual(pad)
+    if rotation:
+        # Non-axis-aligned pad (e.g. a QFP at 45 degrees): block its true outline
+        gx, gy = coord.to_grid(pad.global_x, pad.global_y)
+        blocked.update(iter_pad_blocked_cells(gx, gy, pad.size_x / 2, pad.size_y / 2,
+                                              clearance, coord.grid_step, 0.0, rotation))
+        return
+
     half_w = pad.size_x / 2 + clearance
     half_h = pad.size_y / 2 + clearance
 
@@ -1181,6 +1190,22 @@ def build_base_obstacles(
                         pad_layers_on.append(layer_map[pl])
 
             if not pad_layers_on:
+                continue
+
+            rotation = pad_rotation_residual(pad)
+            if rotation:
+                # Non-axis-aligned pad (e.g. a QFP at 45 degrees): block its true outline
+                gx, gy = coord.to_grid(pad.global_x, pad.global_y)
+                rot_cells = np.array(list(iter_pad_blocked_cells(
+                    gx, gy, pad.size_x / 2, pad.size_y / 2, track_width / 2 + config.clearance,
+                    config.grid_step, 0.0, rotation)), dtype=np.int32).reshape(-1, 2)
+                for layer_idx in pad_layers_on:
+                    layer_col = np.full((rot_cells.shape[0], 1), layer_idx, dtype=np.int32)
+                    obstacles.add_blocked_cells_batch(np.hstack([rot_cells, layer_col]))
+                via_rot_cells = np.array(list(iter_pad_blocked_cells(
+                    gx, gy, pad.size_x / 2, pad.size_y / 2, config.via_size / 2 + track_via_clearance,
+                    config.grid_step, 0.0, rotation)), dtype=np.int32).reshape(-1, 2)
+                obstacles.add_blocked_vias_batch(via_rot_cells)
                 continue
 
             # Block rectangular area around pad with clearance for track routing

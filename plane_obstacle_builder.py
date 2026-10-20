@@ -13,7 +13,7 @@ import numpy as np
 
 from kicad_parser import PCBData, Pad, Segment
 from routing_config import GridRouteConfig, GridCoord
-from routing_utils import iter_pad_blocked_cells
+from routing_utils import iter_pad_blocked_cells, pad_rotation_residual
 from obstacle_map import point_in_polygon, point_to_polygon_edge_distance
 
 import sys
@@ -288,8 +288,9 @@ def _add_pad_via_obstacle(obstacles: GridObstacleMap, pad: Pad,
         corner_radius = pad.roundrect_rratio * min(pad.size_x, pad.size_y)
     else:
         corner_radius = 0
+    rotation = pad_rotation_residual(pad)
 
-    for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, margin, config.grid_step, corner_radius):
+    for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, margin, config.grid_step, corner_radius, rotation):
         obstacles.add_blocked_via(cell_gx, cell_gy)
 
 
@@ -592,7 +593,8 @@ def build_routing_obstacle_map(
                         corner_radius = pad.roundrect_rratio * min(pad.size_x, pad.size_y)
                     else:
                         corner_radius = 0
-                    for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, margin, config.grid_step, corner_radius):
+                    rotation = pad_rotation_residual(pad)
+                    for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, margin, config.grid_step, corner_radius, rotation):
                         obstacles.add_blocked_cell(cell_gx, cell_gy, layer_idx)
                     pad_count += 1
     if verbose:

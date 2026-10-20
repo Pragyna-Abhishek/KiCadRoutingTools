@@ -11,7 +11,7 @@ import numpy as np
 
 from kicad_parser import PCBData
 from routing_config import GridRouteConfig, GridCoord
-from routing_utils import build_layer_map, iter_pad_blocked_cells
+from routing_utils import build_layer_map, iter_pad_blocked_cells, pad_rotation_residual
 from bresenham_utils import walk_line, is_diagonal_segment, get_diagonal_via_blocking_params
 from net_queries import expand_pad_layers
 
@@ -203,11 +203,12 @@ def _collect_pad_obstacles(pad, coord: GridCoord, layer_map: Dict[str, int],
         corner_radius = pad.roundrect_rratio * min(pad.size_x, pad.size_y)
     else:
         corner_radius = 0
+    rotation = pad_rotation_residual(pad)
 
     expanded_layers = expand_pad_layers(pad.layers, config.layers)
 
     # Use shared utility for consistent pad blocking
-    for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, margin, config.grid_step, corner_radius):
+    for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, margin, config.grid_step, corner_radius, rotation):
         for layer in expanded_layers:
             layer_idx = layer_map.get(layer)
             if layer_idx is not None:
@@ -217,7 +218,7 @@ def _collect_pad_obstacles(pad, coord: GridCoord, layer_map: Dict[str, int],
     if any(layer.endswith('.Cu') for layer in expanded_layers):
         # Add half grid step buffer to account for grid quantization errors
         via_margin = config.via_size / 2 + config.clearance + config.grid_step / 2
-        for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, via_margin, config.grid_step, corner_radius):
+        for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, via_margin, config.grid_step, corner_radius, rotation):
             blocked_vias.add((cell_gx, cell_gy))
 
 

@@ -46,7 +46,7 @@ class Pad:
     layers: List[str]
     net_id: int
     net_name: str
-    rotation: float = 0.0  # Total rotation in degrees (pad + footprint)
+    rotation: float = 0.0  # Absolute board orientation in degrees (KiCad stores it with the footprint rotation included)
     pinfunction: str = ""
     drill: float = 0.0  # Drill size for through-hole pads (0 for SMD)
     pintype: str = ""
@@ -837,8 +837,10 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net], name_to_id: 
             local_y = float(pad_at_match.group(2))
             pad_rotation = float(pad_at_match.group(3)) if pad_at_match.group(3) else 0.0
 
-            # Total rotation = pad rotation + footprint rotation
-            total_rotation = (pad_rotation + fp_rotation) % 360
+            # KiCad writes a pad's (at x y angle) angle as its absolute board
+            # orientation, i.e. footprint rotation already included (an LQFP
+            # footprint at -45 has pads at 315), so it is the total rotation.
+            total_rotation = pad_rotation % 360
 
             # Extract size
             size_match = re.search(r'\(size\s+([\d.-]+)\s+([\d.-]+)\)', pad_text)
@@ -1439,7 +1441,9 @@ def build_pcb_data_from_board(board) -> PCBData:
                 except Exception:
                     pad_rotation = pad.GetOrientation() / 10.0
 
-            total_rotation = (pad_rotation + fp_rotation) % 360
+            # GetOrientation() is the absolute board orientation (footprint
+            # rotation included), so it is the total rotation.
+            total_rotation = pad_rotation % 360
 
             # Apply only pad rotation to get board-space dimensions
             pad_rot_normalized = pad_rotation % 180
