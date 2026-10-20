@@ -15,6 +15,7 @@ from geometry_utils import (
     segment_to_segment_closest_points,
 )
 from net_queries import expand_pad_layers
+from routing_utils import pad_half_extents, pad_rotation_residual
 
 
 class SpatialIndex:
@@ -72,9 +73,8 @@ class SpatialIndex:
 
     def add_pad(self, pad: Pad, net_id: int, expanded_layers: List[str]):
         """Add a pad to the index."""
-        # Pad covers a rectangular area
-        half_x = pad.size_x / 2
-        half_y = pad.size_y / 2
+        # Pad covers a rectangular area (bounding box if the pad is rotated)
+        half_x, half_y = pad_half_extents(pad)
         min_cell = self._get_cell(pad.global_x - half_x, pad.global_y - half_y)
         max_cell = self._get_cell(pad.global_x + half_x, pad.global_y + half_y)
 
@@ -346,6 +346,21 @@ def segment_to_rect_distance(x1: float, y1: float, x2: float, y2: float,
     return min_dist, closest_pt
 
 
+def _to_pad_frame(pad: Pad, x: float, y: float, rotation: float) -> Tuple[float, float]:
+    """Board point -> offset in a rotated pad's own frame (KiCad y-down convention)."""
+    rad = math.radians(rotation)
+    dx, dy = x - pad.global_x, y - pad.global_y
+    return (dx * math.cos(rad) - dy * math.sin(rad),
+            dx * math.sin(rad) + dy * math.cos(rad))
+
+
+def _from_pad_frame(pad: Pad, lx: float, ly: float, rotation: float) -> Tuple[float, float]:
+    """Inverse of _to_pad_frame()."""
+    rad = math.radians(rotation)
+    return (pad.global_x + lx * math.cos(rad) + ly * math.sin(rad),
+            pad.global_y - lx * math.sin(rad) + ly * math.cos(rad))
+
+
 def check_pad_segment_overlap(pad: Pad, seg: Segment, clearance: float,
                                routing_layers: List[str],
                                clearance_margin: float = 0.05) -> Tuple[bool, float, Optional[Tuple[float, float]]]:
@@ -377,11 +392,22 @@ def check_pad_segment_overlap(pad: Pad, seg: Segment, clearance: float,
         corner_radius = 0.0
 
     # Calculate distance from segment to rectangular pad (with optional rounded corners)
-    dist_to_pad, closest_pt = segment_to_rect_distance(
-        seg.start_x, seg.start_y, seg.end_x, seg.end_y,
-        pad.global_x, pad.global_y, pad.size_x / 2, pad.size_y / 2,
-        corner_radius
-    )
+    rotation = pad_rotation_residual(pad)
+    if rotation:
+        # Measure in the rotated pad's own frame, then map the closest point back
+        sx, sy = _to_pad_frame(pad, seg.start_x, seg.start_y, rotation)
+        ex, ey = _to_pad_frame(pad, seg.end_x, seg.end_y, rotation)
+        dist_to_pad, closest_pt = segment_to_rect_distance(
+            sx, sy, ex, ey, 0.0, 0.0, pad.size_x / 2, pad.size_y / 2, corner_radius
+        )
+        if closest_pt is not None:
+            closest_pt = _from_pad_frame(pad, closest_pt[0], closest_pt[1], rotation)
+    else:
+        dist_to_pad, closest_pt = segment_to_rect_distance(
+            seg.start_x, seg.start_y, seg.end_x, seg.end_y,
+            pad.global_x, pad.global_y, pad.size_x / 2, pad.size_y / 2,
+            corner_radius
+        )
 
     # Required clearance: segment half-width + clearance
     # (dist_to_pad is already edge-to-edge from pad)
@@ -426,12 +452,19 @@ def check_pad_via_overlap(pad: Pad, via: Via, clearance: float,
         corner_radius = 0.0
 
     # Distance from via center to pad edge (accounts for rounded corners)
-    dist_to_pad = point_to_rect_distance(
-        via.x, via.y,
-        pad.global_x, pad.global_y,
-        pad.size_x / 2, pad.size_y / 2,
-        corner_radius
-    )
+    rotation = pad_rotation_residual(pad)
+    if rotation:
+        vx, vy = _to_pad_frame(pad, via.x, via.y, rotation)
+        dist_to_pad = point_to_rect_distance(
+            vx, vy, 0.0, 0.0, pad.size_x / 2, pad.size_y / 2, corner_radius
+        )
+    else:
+        dist_to_pad = point_to_rect_distance(
+            via.x, via.y,
+            pad.global_x, pad.global_y,
+            pad.size_x / 2, pad.size_y / 2,
+            corner_radius
+        )
 
     # Required clearance: via half-size + clearance
     # (dist_to_pad is already edge-to-edge from pad)

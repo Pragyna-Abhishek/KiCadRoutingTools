@@ -46,7 +46,7 @@ class Pad:
     layers: List[str]
     net_id: int
     net_name: str
-    rotation: float = 0.0  # Total rotation in degrees (pad + footprint)
+    rotation: float = 0.0  # Absolute board orientation in degrees (KiCad stores it with the footprint rotation included)
     pinfunction: str = ""
     drill: float = 0.0  # Drill size for through-hole pads (0 for SMD)
     pintype: str = ""
@@ -388,35 +388,72 @@ def _arc_to_segments(start: Tuple[float, float], mid: Tuple[float, float],
     return segments
 
 
+def _iter_sexpr_elements(content: str, tag: str):
+    """Yield the complete text of every ``(tag ...)`` element in content.
+
+    Each element is delimited by balanced parentheses (quoted strings are
+    skipped), so a caller can inspect that element's own fields, e.g. its
+    ``(layer ...)``, without a regex running on into the next element.
+    """
+    for m in re.finditer(r'\(' + re.escape(tag) + r'[\s)]', content):
+        start = m.start()
+        depth = 0
+        in_str = False
+        i = start
+        n = len(content)
+        while i < n:
+            c = content[i]
+            if in_str:
+                if c == '\\':
+                    i += 1
+                elif c == '"':
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    yield content[start:i + 1]
+                    break
+            i += 1
+
+
+_EDGE_CUTS_LAYER_RE = re.compile(r'\(layer\s+"Edge\.Cuts"\)')
+_GR_START_END_RE = re.compile(r'^\(gr_(?:line|rect)\s+\(start\s+([\d.-]+)\s+([\d.-]+)\)\s+\(end\s+([\d.-]+)\s+([\d.-]+)\)')
+_GR_ARC_RE = re.compile(r'^\(gr_arc\s+\(start\s+([\d.-]+)\s+([\d.-]+)\)\s+\(mid\s+([\d.-]+)\s+([\d.-]+)\)\s+\(end\s+([\d.-]+)\s+([\d.-]+)\)')
+
+
+def _iter_edge_cuts_elements(content: str, tag: str):
+    """Yield the field regex match of each ``tag`` element whose OWN layer is Edge.Cuts."""
+    field_re = _GR_ARC_RE if tag == 'gr_arc' else _GR_START_END_RE
+    for elem in _iter_sexpr_elements(content, tag):
+        if not _EDGE_CUTS_LAYER_RE.search(elem):
+            continue
+        m = field_re.match(elem)
+        if m:
+            yield m
+
+
 def extract_board_bounds(content: str) -> Optional[Tuple[float, float, float, float]]:
     """Extract board outline bounds from Edge.Cuts layer."""
     min_x = min_y = float('inf')
     max_x = max_y = float('-inf')
     found = False
 
-    # Look for gr_rect on Edge.Cuts (multi-line format)
-    rect_pattern = r'\(gr_rect\s+\(start\s+([\d.-]+)\s+([\d.-]+)\)\s+\(end\s+([\d.-]+)\s+([\d.-]+)\).*?\(layer\s+"Edge\.Cuts"\)'
-    for m in re.finditer(rect_pattern, content, re.DOTALL):
-        x1, y1, x2, y2 = float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
-        min_x = min(min_x, x1, x2)
-        min_y = min(min_y, y1, y2)
-        max_x = max(max_x, x1, x2)
-        max_y = max(max_y, y1, y2)
-        found = True
-
-    # Look for gr_line on Edge.Cuts (multi-line format)
-    line_pattern = r'\(gr_line\s+\(start\s+([\d.-]+)\s+([\d.-]+)\)\s+\(end\s+([\d.-]+)\s+([\d.-]+)\).*?\(layer\s+"Edge\.Cuts"\)'
-    for m in re.finditer(line_pattern, content, re.DOTALL):
-        x1, y1, x2, y2 = float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
-        min_x = min(min_x, x1, x2)
-        min_y = min(min_y, y1, y2)
-        max_x = max(max_x, x1, x2)
-        max_y = max(max_y, y1, y2)
-        found = True
+    # gr_rect and gr_line on Edge.Cuts (multi-line format)
+    for tag in ('gr_rect', 'gr_line'):
+        for m in _iter_edge_cuts_elements(content, tag):
+            x1, y1, x2, y2 = float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
+            min_x = min(min_x, x1, x2)
+            min_y = min(min_y, y1, y2)
+            max_x = max(max_x, x1, x2)
+            max_y = max(max_y, y1, y2)
+            found = True
 
     # Look for gr_arc on Edge.Cuts (multi-line format)
-    arc_pattern = r'\(gr_arc\s+\(start\s+([\d.-]+)\s+([\d.-]+)\)\s+\(mid\s+([\d.-]+)\s+([\d.-]+)\)\s+\(end\s+([\d.-]+)\s+([\d.-]+)\).*?\(layer\s+"Edge\.Cuts"\)'
-    for m in re.finditer(arc_pattern, content, re.DOTALL):
+    for m in _iter_edge_cuts_elements(content, 'gr_arc'):
         sx, sy = float(m.group(1)), float(m.group(2))
         mx, my = float(m.group(3)), float(m.group(4))
         ex, ey = float(m.group(5)), float(m.group(6))
@@ -435,26 +472,28 @@ def extract_board_bounds(content: str) -> Optional[Tuple[float, float, float, fl
 
 
 def _collect_edge_cuts_segments(content: str) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
-    """Parse all gr_line, gr_arc, and gr_rect segments on Edge.Cuts from file content."""
+    """Parse all gr_line, gr_arc, and gr_rect segments on Edge.Cuts from file content.
+
+    Each gr_* element is parsed as a whole and kept only if its own layer is
+    Edge.Cuts. (A lazy ``.*?(layer "Edge.Cuts")`` regex let e.g. a gr_rect on
+    F.SilkS run on into the next Edge.Cuts element and become a fake cutout.)
+    """
     segments = []
 
     # gr_line
-    line_pattern = r'\(gr_line\s+\(start\s+([\d.-]+)\s+([\d.-]+)\)\s+\(end\s+([\d.-]+)\s+([\d.-]+)\).*?\(layer\s+"Edge\.Cuts"\)'
-    for m in re.finditer(line_pattern, content, re.DOTALL):
+    for m in _iter_edge_cuts_elements(content, 'gr_line'):
         x1, y1, x2, y2 = float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
         segments.append(((x1, y1), (x2, y2)))
 
     # gr_arc - approximate as polyline
-    arc_pattern = r'\(gr_arc\s+\(start\s+([\d.-]+)\s+([\d.-]+)\)\s+\(mid\s+([\d.-]+)\s+([\d.-]+)\)\s+\(end\s+([\d.-]+)\s+([\d.-]+)\).*?\(layer\s+"Edge\.Cuts"\)'
-    for m in re.finditer(arc_pattern, content, re.DOTALL):
+    for m in _iter_edge_cuts_elements(content, 'gr_arc'):
         sx, sy = float(m.group(1)), float(m.group(2))
         mx, my = float(m.group(3)), float(m.group(4))
         ex, ey = float(m.group(5)), float(m.group(6))
         segments.extend(_arc_to_segments((sx, sy), (mx, my), (ex, ey)))
 
     # gr_rect - expand to 4 line segments
-    rect_pattern = r'\(gr_rect\s+\(start\s+([\d.-]+)\s+([\d.-]+)\)\s+\(end\s+([\d.-]+)\s+([\d.-]+)\).*?\(layer\s+"Edge\.Cuts"\)'
-    for m in re.finditer(rect_pattern, content, re.DOTALL):
+    for m in _iter_edge_cuts_elements(content, 'gr_rect'):
         x1, y1, x2, y2 = float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))
         segments.append(((x1, y1), (x2, y1)))
         segments.append(((x2, y1), (x2, y2)))
@@ -798,8 +837,10 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net], name_to_id: 
             local_y = float(pad_at_match.group(2))
             pad_rotation = float(pad_at_match.group(3)) if pad_at_match.group(3) else 0.0
 
-            # Total rotation = pad rotation + footprint rotation
-            total_rotation = (pad_rotation + fp_rotation) % 360
+            # KiCad writes a pad's (at x y angle) angle as its absolute board
+            # orientation, i.e. footprint rotation already included (an LQFP
+            # footprint at -45 has pads at 315), so it is the total rotation.
+            total_rotation = pad_rotation % 360
 
             # Extract size
             size_match = re.search(r'\(size\s+([\d.-]+)\s+([\d.-]+)\)', pad_text)
@@ -1400,7 +1441,9 @@ def build_pcb_data_from_board(board) -> PCBData:
                 except Exception:
                     pad_rotation = pad.GetOrientation() / 10.0
 
-            total_rotation = (pad_rotation + fp_rotation) % 360
+            # GetOrientation() is the absolute board orientation (footprint
+            # rotation included), so it is the total rotation.
+            total_rotation = pad_rotation % 360
 
             # Apply only pad rotation to get board-space dimensions
             pad_rot_normalized = pad_rotation % 180

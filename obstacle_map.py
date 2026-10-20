@@ -12,7 +12,7 @@ import math
 
 from kicad_parser import PCBData, Segment, Via, Pad
 from routing_config import GridRouteConfig, GridCoord
-from routing_utils import build_layer_map, iter_pad_blocked_cells
+from routing_utils import build_layer_map, iter_pad_blocked_cells, pad_rotation_residual
 from bresenham_utils import walk_line, is_diagonal_segment, get_diagonal_via_blocking_params
 from net_queries import expand_pad_layers
 from obstacle_costs import add_bga_proximity_costs
@@ -1130,12 +1130,14 @@ def _add_pad_obstacle(obstacles: GridObstacleMap, pad, coord: GridCoord,
         corner_radius = pad.roundrect_rratio * min(pad.size_x, pad.size_y)
     else:
         corner_radius = 0
+    # Non-axis-aligned pads (e.g. a QFP at 45 degrees) are blocked at their true angle
+    rotation = pad_rotation_residual(pad)
 
     # Expand wildcard layers like "*.Cu" to actual routing layers
     expanded_layers = expand_pad_layers(pad.layers, config.layers)
 
     # Use shared utility for consistent pad blocking
-    for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, margin, config.grid_step, corner_radius):
+    for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, margin, config.grid_step, corner_radius, rotation):
         for layer in expanded_layers:
             layer_idx = layer_map.get(layer)
             if layer_idx is not None:
@@ -1146,7 +1148,7 @@ def _add_pad_obstacle(obstacles: GridObstacleMap, pad, coord: GridCoord,
     # Via blocking near pads - block vias if pad is on any copper layer
     if any(layer.endswith('.Cu') for layer in expanded_layers):
         via_margin = config.via_size / 2 + clearance + extra_clearance
-        for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, via_margin, config.grid_step, corner_radius):
+        for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, via_margin, config.grid_step, corner_radius, rotation):
             obstacles.add_blocked_via(cell_gx, cell_gy)
             if blocked_vias is not None:
                 blocked_vias.add((cell_gx, cell_gy))

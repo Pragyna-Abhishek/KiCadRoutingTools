@@ -12,7 +12,7 @@ import numpy as np
 
 from kicad_parser import PCBData, Pad
 from routing_config import GridRouteConfig, GridCoord
-from routing_utils import iter_pad_blocked_cells
+from routing_utils import iter_pad_blocked_cells, pad_rotation_residual
 from bresenham_utils import walk_line
 from pcb_modification import remove_net_from_pcb_data, restore_net_to_pcb_data
 from obstacle_cache import ViaPlacementObstacleData, precompute_via_placement_obstacles
@@ -58,8 +58,9 @@ def _re_add_pad_obstacles_for_net(
                 corner_radius = pad.roundrect_rratio * min(pad.size_x, pad.size_y)
             else:
                 corner_radius = 0
+            rotation = pad_rotation_residual(pad)
 
-            for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, margin, config.grid_step, corner_radius):
+            for cell_gx, cell_gy in iter_pad_blocked_cells(gx, gy, half_width, half_height, margin, config.grid_step, corner_radius, rotation):
                 obstacles.add_blocked_cell(cell_gx, cell_gy, 0)  # layer_idx=0 for single-layer maps
 
 
